@@ -1,0 +1,15 @@
+trailingComma: 'es5'
+printWidth: 120
+tabWidth: 4
+semi: true
+singleQuote: true
+jsxSingleQuote: true
+bracketSpacing: false
+proseWrap: 'always'
+overrides:
+  - files: ['*.md']
+    options: {printWidth: 80}
+  - files: ['*.html', '*.css', '*.less', '*.scss', '*.md', '*.json', '*.yml', '*.yaml', '*.xml']
+    options: {tabWidth: 2}
+  - files: ['*.php']
+    options: {phpVersion: '7.1', braceStyle: '1tbs'}
