@@ -1,0 +1,11 @@
+Dockerfile
+.dockerignore
+.env
+.git
+.gitignore
+LICENSE
+node_modules
+.prettierignore
+.prettierrc.yaml
+.readme
+README.md

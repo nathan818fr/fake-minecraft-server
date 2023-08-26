@@ -1,0 +1,49 @@
+name: Docker Image CI
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  PROJECT_URL: https://github.com/${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions: write-all # required to push to GitHub Container Registry
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Login to GitHub Container Registry
+        run: |
+          buildah login -u "$REGISTRY_USER" --password-stdin <<<"$REGISTRY_PASSWORD" "${IMAGE%%/*}"
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ github.token }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+        with:
+          platforms: arm64
+
+      - name: Build
+        run: |
+          set -ex
+          tags=("${IMAGE}:${GITHUB_REF_NAME}" "${IMAGE}:latest")
+          buildah build \
+            --platform linux/amd64,linux/arm64 \
+            --manifest "${tags[0]}" \
+            --timestamp="$(git show -s --format=%ct HEAD)" \
+            --label="org.opencontainers.image.url=${PROJECT_URL}" \
+            --label="org.opencontainers.image.source=${PROJECT_URL}" \
+            --label="org.opencontainers.image.version=${GITHUB_REF_NAME}" \
+            --label="org.opencontainers.image.revision=${GITHUB_SHA}"
+          for tag in "${tags[@]:1}"; do
+            buildah tag -- "${tags[0]}" "$tag"
+          done
+          for tag in "${tags[@]}"; do
+            buildah push -- "$tag"
+          done
