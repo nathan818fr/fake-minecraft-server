@@ -1,7 +1,7 @@
 {
   "name": "fake-minecraft-server",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Nathan Poirier <nathan@poirier.io>",
   "type": "module",
   "scripts": {
