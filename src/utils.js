@@ -12,11 +12,14 @@ export function log(message, ...args) {
 /**
  * Formats the given IP address by removing the IPv6 encapsulation or enclosing IPv6 in square brackets.
  *
- * @param {string} address - The IP address to format.
+ * @param {string|undefined} address - The IP address to format.
  * @param {boolean} [enclosedIpv6=true] - Whether to enclose IPv6 addresses in square brackets.
  * @returns {string} The formatted IP address.
  */
 export function formatAddress(address, enclosedIpv6 = true) {
+    if (!address) {
+        return 'undefined';
+    }
     if (address.startsWith('::ffff:')) {
         return address.slice(7);
     }
