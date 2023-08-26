@@ -14,3 +14,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # Use node LTS
+      - dependency-name: node
+        versions: [20.x]
