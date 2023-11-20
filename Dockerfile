@@ -1,4 +1,4 @@
-FROM docker.io/library/node:18.17.1-alpine3.18
+FROM docker.io/library/node:21.2.0-alpine3.18
 
 ENV NODE_ENV=production
 
