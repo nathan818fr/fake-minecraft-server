@@ -210,8 +210,8 @@ export function readHandshake(buf) {
     }
 
     // read protocol version
-    const protocolVersion = buf.readVarInt(4);
-    if (protocolVersion === false || protocolVersion <= 0) {
+    const protocolVersion = buf.readVarInt(5);
+    if (protocolVersion === false) {
         return false; // fail (illegal version)
     }
 
