@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    paths-ignore: &unrelated-paths
+      - "**.md"
+      - LICENSE
+      - .gitignore
+      - .github/renovate.json5
+      - .github/workflows/release.yaml
+  pull_request:
+    paths-ignore: *unrelated-paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up tools
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+
+      - name: Check
+        run: mise run check
+
+      # The image is built for every change, to catch issues before a release.
+      - name: Build image
+        run: mise run image
