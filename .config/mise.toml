@@ -1,0 +1,48 @@
+[settings]
+lockfile = true
+
+# Renovate keeps mise.lock on the latest versions within these ranges.
+[tools]
+go = "1"
+golangci-lint = "2"
+
+[tasks.dev]
+description = "Run the server from source"
+run = "go run ./cmd/fake-minecraft-server"
+
+[tasks.fmt]
+description = "Format the code"
+run = "golangci-lint fmt --config .config/golangci.yaml"
+
+[tasks.lint]
+description = "Run golangci-lint, which also checks formatting"
+run = "golangci-lint run --config .config/golangci.yaml"
+
+[tasks.test]
+description = "Run the tests with the race detector"
+run = "go test -race ./..."
+
+[tasks.bench]
+description = "Run the benchmarks"
+run = "go test -run '^$' -bench . -benchmem ./..."
+
+[tasks.check]
+description = "Run everything CI runs"
+depends = ["lint", "test"]
+
+[tasks.image]
+description = "Build the container image, for linux/amd64 and linux/arm64"
+run = '''
+image="${IMAGE:-localhost/fake-minecraft-server}"
+version="$(git describe --tags --always --dirty)"
+go_version="$(go env GOVERSION)"
+go_version="${go_version#go}"
+if podman manifest exists "$image"; then podman manifest rm "$image" >/dev/null; fi
+podman build --platform linux/amd64,linux/arm64 --manifest "$image" \
+  --build-arg VERSION="$version" \
+  --build-arg GO_VERSION="$go_version" \
+  --timestamp "$(git log -1 --format=%ct)" \
+  --label "org.opencontainers.image.version=$version" \
+  --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+  .
+'''

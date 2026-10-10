@@ -1,0 +1,16 @@
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  // All non-breaking updates come together in a single monthly pull request,
+  // and only for releases at least a week old. Security updates are not
+  // delayed.
+  extends: ['config:recommended', 'group:all', 'schedule:monthly'],
+  minimumReleaseAge: '7 days',
+  packageRules: [
+    {
+      // Major updates may break things: they wait for an approval on the
+      // Dependency Dashboard.
+      matchUpdateTypes: ['major'],
+      dependencyDashboardApproval: true,
+    },
+  ],
+}

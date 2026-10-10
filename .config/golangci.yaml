@@ -1,0 +1,27 @@
+# Passed by the lint and fmt tasks of mise: golangci-lint only looks for its
+# configuration at the root of the repository.
+version: "2"
+
+linters:
+  # gosec and noctx are left out: they flag the conversions of VarInts, the
+  # files that the operator names, and the connections of tests.
+  default: standard
+  enable:
+    - copyloopvar
+    - errorlint
+    - gocritic
+    - intrange
+    - misspell
+    - nolintlint
+    - perfsprint
+    - unconvert
+    - usestdlibvars
+
+formatters:
+  # gofmt, with the imports of this module in a group of their own.
+  enable:
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/nathan818fr/fake-minecraft-server

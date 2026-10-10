@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+permissions: {}
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # All the tags, to tell whether this release is the highest one.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up tools
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+
+      - name: Check
+        run: mise run check
+
+      - name: Build image
+        run: mise run image
+
+      - name: Publish image
+        env:
+          REGISTRY: ghcr.io
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          podman login --username "$GITHUB_ACTOR" --password-stdin "$REGISTRY" <<<"$REGISTRY_TOKEN"
+          # Releases (v1.2.3) also move their major version (v1) and latest, if
+          # they are the highest release of that major version and of all, so
+          # that a fix to an older release does not replace a newer one.
+          # Pre-releases (v1.3.0-rc.1) move neither.
+          highest_release() {
+            git tag --list "$1" | grep -v -- - | sort -V | tail -n 1
+          }
+          tags=("$GITHUB_REF_NAME")
+          if [[ "$GITHUB_REF_NAME" != *-* ]]; then
+            major="${GITHUB_REF_NAME%%.*}"
+            if [[ "$(highest_release "$major.*")" == "$GITHUB_REF_NAME" ]]; then
+              tags+=("$major")
+            fi
+            if [[ "$(highest_release 'v*')" == "$GITHUB_REF_NAME" ]]; then
+              tags+=(latest)
+            fi
+          fi
+          for tag in "${tags[@]}"; do
+            podman manifest push --all localhost/fake-minecraft-server "docker://${REGISTRY}/${GITHUB_REPOSITORY}:${tag}"
+          done
