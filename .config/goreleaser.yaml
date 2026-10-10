@@ -1,0 +1,24 @@
+version: 2
+project_name: fake-minecraft-server
+
+builds:
+  - main: ./cmd/fake-minecraft-server
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: ["-s -w"]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - formats: [tar.gz]
+    files: [LICENSE, README.md]
+
+checksum:
+  name_template: checksums.txt
+
+# Published last by the release workflow.
+release:
+  draft: true
+  replace_existing_draft: true
+  prerelease: auto

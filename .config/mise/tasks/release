@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+#MISE description="Upload the binaries of the tag to a draft GitHub release (run by CI)"
+#MISE tools={goreleaser="2"}
+set -Eeuo pipefail
+shopt -s inherit_errexit
+
+function main() {
+  local version release newest
+  # Not "git describe": a commit can have several tags (v2.0.0-rc.1, v2.0.0).
+  version="$GITHUB_REF_NAME"
+  release="${version#v}"
+  release="${release%%-*}"
+  # Releases only go forward, so that each one can move the v2 and latest image
+  # tags; a pre-release counts as the release it previews.
+  newest="$(newest_release "$version")"
+  if [[ -n "$newest" ]] && ! is_newer "v${release}" "$newest"; then
+    echo "error: ${version} is not newer than the release ${newest}" >&2
+    return 1
+  fi
+  GORELEASER_CURRENT_TAG="$version" goreleaser release \
+    --clean \
+    --config .config/goreleaser.yaml
+}
+
+# Print the newest release, not a pre-release, other than the given tag.
+function newest_release() {
+  local _tags
+  _tags="$(git tag --list --sort=-version:refname 'v*')"
+  awk -v self="$1" -- '!/-/ && $0 != self { print; exit }' <<<"$_tags"
+}
+
+function is_newer() {
+  if [[ "$1" == "$2" ]]; then return 1; fi
+  printf '%s\n' "$2" "$1" | sort -V -C
+}
+
+eval 'main "$@";exit "$?"'

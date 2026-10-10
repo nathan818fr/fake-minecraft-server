@@ -1,0 +1,72 @@
+[settings]
+lockfile = true
+
+# Renovate keeps mise.lock on the latest versions within these ranges.
+[tools]
+go = "1"
+golangci-lint = "2"
+dprint = "0"
+
+[tasks.dev]
+description = "Run the server from source"
+run = "go run ./cmd/fake-minecraft-server"
+
+[tasks.fmt]
+description = "Format the code, the documentation and the scripts"
+tools = { shfmt = "3" }
+run = [
+  "golangci-lint fmt --config .config/golangci.yaml",
+  "dprint fmt",
+  "shfmt -i 2 -w .config/mise/tasks",
+]
+
+[tasks.lint]
+description = "Run golangci-lint, which also checks formatting, dprint, shfmt, shellcheck, actionlint and hadolint"
+tools = { shfmt = "3", shellcheck = "0", actionlint = "1", hadolint = "2" }
+run = [
+  "golangci-lint run --config .config/golangci.yaml",
+  "dprint check",
+  "shfmt -i 2 -d .config/mise/tasks",
+  "shellcheck .config/mise/tasks/*",
+  "actionlint",
+  "hadolint Containerfile",
+]
+
+[tasks.test]
+description = "Run the tests with the race detector"
+run = "go test -race ./..."
+
+[tasks.vuln]
+description = "Report the known vulnerabilities that the code reaches"
+tools = { "go:golang.org/x/vuln/cmd/govulncheck" = "1" }
+run = "govulncheck ./..."
+
+[tasks.check]
+description = "Run everything CI runs"
+depends = ["lint", "test", "vuln"]
+
+[tasks.bench]
+description = "Run the benchmarks"
+run = "go test -run '^$' -bench . -benchmem ./..."
+
+[tasks.dist]
+description = "Build the release binaries and archives in dist/, without publishing them"
+tools = { goreleaser = "2" }
+run = "goreleaser release --snapshot --clean --config .config/goreleaser.yaml"
+
+[tasks.image]
+description = "Build the container image, from the binaries of dist"
+depends = ["dist"]
+run = '''
+image="${IMAGE:-localhost/fake-minecraft-server}"
+info="$(go version -m -- dist/fake-minecraft-server_linux_amd64_*/fake-minecraft-server)"
+version="$(printf '%s\n' "$info" | awk '$1 == "mod" { print $3 }')"
+if podman manifest exists "$image"; then podman manifest rm "$image" >/dev/null; fi
+podman build \
+  --platform linux/amd64,linux/arm64 \
+  --manifest "$image" \
+  --timestamp "$(git log -1 --format=%ct)" \
+  --label "org.opencontainers.image.version=${version}" \
+  --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+  -- .
+'''

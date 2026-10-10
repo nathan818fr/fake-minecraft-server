@@ -1,0 +1,12 @@
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  // Security updates are not delayed.
+  extends: ['config:recommended', 'group:all', 'schedule:monthly'],
+  minimumReleaseAge: '7 days',
+  packageRules: [
+    {
+      matchUpdateTypes: ['major'],
+      dependencyDashboardApproval: true,
+    },
+  ],
+}
