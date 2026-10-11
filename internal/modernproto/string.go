@@ -41,6 +41,7 @@ func readString(r Reader, maxBytes int) (string, error) {
 	return string(s), nil
 }
 
+// AppendString appends s prefixed with its length in bytes.
 func AppendString(b []byte, s string) []byte {
 	b = AppendVarInt(b, int32(len(s)))
 	return append(b, s...)

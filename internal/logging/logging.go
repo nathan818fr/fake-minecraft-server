@@ -16,6 +16,10 @@ import (
 // timeFormat is RFC 3339 in UTC with milliseconds, used by both formats.
 const timeFormat = "2006-01-02T15:04:05.000Z"
 
+// durationPrecision is the precision of logged durations: finer digits would
+// only be noise.
+const durationPrecision = 100 * time.Microsecond
+
 type Format string
 
 const (
@@ -24,12 +28,11 @@ const (
 )
 
 func ParseFormat(s string) (Format, error) {
-	switch Format(s) {
+	switch format := Format(s); format {
 	case FormatText, FormatJSON:
-		return Format(s), nil
-	default:
-		return "", fmt.Errorf("unknown log format %q, want %q or %q", s, FormatText, FormatJSON)
+		return format, nil
 	}
+	return "", fmt.Errorf("must be %s or %s, got %q", FormatText, FormatJSON, s)
 }
 
 func NewHandler(w io.Writer, format Format, level slog.Leveler) slog.Handler {
@@ -70,8 +73,32 @@ func replaceJSONAttr(_ []string, a slog.Attr) slog.Attr {
 	return a
 }
 
-// Untrusted returns an attribute for a value sent by a client, escaped in logs
-// so that it cannot forge their content.
+// Duration returns an attribute for d, rounded to durationPrecision.
+func Duration(key string, d time.Duration) slog.Attr {
+	return slog.Duration(key, d.Round(durationPrecision))
+}
+
+// MaxUntrustedLength bounds the length, in bytes, of the untrusted values in
+// logs that nothing else bounds, such as the version names of servers, which
+// can be as long as their status (see Shorten). Values that the protocol
+// bounds, such as hosts, are logged whole.
+const MaxUntrustedLength = 64
+
+// Shorten returns s cut to MaxUntrustedLength bytes, followed by "..." if it is
+// cut. The cut never splits a character.
+func Shorten(s string) string {
+	if len(s) <= MaxUntrustedLength {
+		return s
+	}
+	n := MaxUntrustedLength
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "..."
+}
+
+// Untrusted returns an attribute for a value sent by a client or a server,
+// escaped in logs so that it cannot forge their content.
 func Untrusted(key, value string) slog.Attr {
 	return slog.Any(key, untrusted(value))
 }

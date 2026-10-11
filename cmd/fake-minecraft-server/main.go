@@ -11,28 +11,32 @@ import (
 	"runtime/debug"
 	"syscall"
 
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/config"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/logging"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/server"
 )
 
 const usage = `Usage: fake-minecraft-server [command]
 
-Without a command, runs the server, configured by environment variables:
-see https://github.com/nathan818fr/fake-minecraft-server.
+Without a command, runs the server, configured by FMS_CONFIG_FILE and the
+FMS_ variables: see https://github.com/nathan818fr/fake-minecraft-server.
 
 Commands:
+  check                  Check the configuration, without starting the server
   version                Print the version
   help                   Print this help
 `
 
 func main() {
-	// Until run sets up the configured logger, errors are logged in the
+	// Until load sets up the configured logger, errors are logged in the
 	// default format.
 	slog.SetDefault(slog.New(logging.NewTextHandler(os.Stdout, nil)))
 	var err error
 	switch args := os.Args[1:]; {
 	case len(args) == 0:
 		err = run()
+	case args[0] == "check" && len(args) == 1:
+		err = check()
 	case args[0] == "version" && len(args) == 1:
 		fmt.Println(currentVersion())
 	case args[0] == "help" && len(args) == 1:
@@ -50,20 +54,15 @@ func main() {
 }
 
 func run() error {
-	cfg, err := loadConfig(os.LookupEnv)
+	cfg, err := load()
 	if err != nil {
 		return err
 	}
 
-	logger := slog.New(logging.NewHandler(os.Stdout, cfg.logFormat, cfg.logLevel))
-	// Errors returned from now on are logged in the configured format too.
-	slog.SetDefault(logger)
+	logger := slog.Default()
 	logger.Info("starting", "version", currentVersion())
-	for _, warning := range cfg.warnings {
-		logger.Warn(warning)
-	}
 
-	srv, err := server.New(cfg.server, logger)
+	srv, err := server.New(cfg.Server, logger)
 	if err != nil {
 		return err
 	}
@@ -74,11 +73,36 @@ func run() error {
 	// one kills the server without waiting for its connections.
 	context.AfterFunc(ctx, stop)
 
-	listeners, err := listen(ctx, cfg.listenAddrs, cfg.listenerOptions)
+	listeners, err := listen(ctx, cfg.Listeners)
 	if err != nil {
 		return err
 	}
 	return srv.Serve(ctx, listeners...)
+}
+
+// check loads the configuration and makes the server as run does, without
+// listening.
+func check() error {
+	cfg, err := load()
+	if err != nil {
+		return err
+	}
+	if _, err := server.New(cfg.Server, slog.Default()); err != nil {
+		return err
+	}
+	slog.Info("configuration valid")
+	return nil
+}
+
+// load reads the configuration, and sets up the logger that it configures.
+func load() (config.Config, error) {
+	cfg, err := config.Load(os.Environ())
+	if cfg.LogFormat != "" {
+		// Errors returned from now on, including the ones of the other
+		// settings, are logged in the configured format too.
+		slog.SetDefault(slog.New(logging.NewHandler(os.Stdout, cfg.LogFormat, cfg.LogLevel)))
+	}
+	return cfg, err
 }
 
 // currentVersion returns the version that Go stamped in the binary from

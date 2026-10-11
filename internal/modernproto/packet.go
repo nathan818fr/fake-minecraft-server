@@ -26,6 +26,8 @@ const (
 // include.
 const packetIDLength = 1
 
+// PingPayloadLength is the length of the payload of ping requests and pong
+// responses: a timestamp that the server echoes.
 const PingPayloadLength = 8
 
 // maxPacketLengthBytes is the most bytes a packet length takes, as vanilla
@@ -93,6 +95,8 @@ func readPacketHeader(r Reader, id byte, minPayloadLength, maxPayloadLength int)
 	return payloadLength, nil
 }
 
+// AppendPacketHeader appends the length and ID of a packet whose payload of
+// payloadLength bytes is written separately.
 func AppendPacketHeader(b []byte, id byte, payloadLength int) []byte {
 	b = AppendVarInt(b, int32(packetIDLength+payloadLength))
 	return append(b, id)

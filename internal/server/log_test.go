@@ -2,8 +2,10 @@ package server
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"regexp"
 	"strings"
@@ -29,17 +31,17 @@ func TestLogging(t *testing.T) {
 				c.write(modernproto.AppendPacket(nil, modernproto.PingRequestID, make([]byte, 8)))
 				c.readPacket(modernproto.PongResponseID)
 			},
-			want: `INFO  \[127\.0\.0\.1\]:\d+ server list ping: protocol=777 server_address="localhost" server_port=25565 ping_request=true ` + timing,
+			want: `INFO  \[127\.0\.0\.1\]:\d+ server list ping: protocol=777 host="localhost" port=25565 rule=0 server=test ping_request=true ` + timing,
 		},
 		{
 			name:   "status without ping",
 			client: func(c *client) { c.statusExchange(777); _ = c.conn.(*net.TCPConn).CloseWrite(); c.expectClosed() },
-			want:   `INFO  \S+ server list ping: protocol=777 server_address="localhost" server_port=25565 ping_request=false ` + timing,
+			want:   `INFO  \S+ server list ping: protocol=777 host="localhost" port=25565 rule=0 server=test ping_request=false ` + timing,
 		},
 		{
 			name:   "status then reset",
 			client: func(c *client) { c.statusExchange(777); _ = c.conn.(*net.TCPConn).SetLinger(0) },
-			want:   `INFO  \S+ server list ping: protocol=777 server_address="localhost" server_port=25565 ping_request=false ` + timing,
+			want:   `INFO  \S+ server list ping: protocol=777 host="localhost" port=25565 rule=0 server=test ping_request=false ` + timing,
 		},
 		{
 			name: "status of a Forge client",
@@ -56,7 +58,7 @@ func TestLogging(t *testing.T) {
 				_ = c.conn.(*net.TCPConn).CloseWrite()
 				c.expectClosed()
 			},
-			want: `INFO  \S+ server list ping: protocol=767 server_address="localhost" server_address_extra="FML3\\x00" server_port=25565 ping_request=false ` + timing,
+			want: `INFO  \S+ server list ping: protocol=767 host="localhost" host_extra="FML3\\x00" port=25565 rule=0 server=test ping_request=false ` + timing,
 		},
 		{
 			name: "login",
@@ -66,12 +68,12 @@ func TestLogging(t *testing.T) {
 				c.write(modernproto.AppendPacket(nil, modernproto.LoginStartID, append(modernproto.AppendString(nil, "Notch"), uuid...)))
 				c.readPacket(modernproto.LoginDisconnectID)
 			},
-			want: `INFO  \S+ login attempt: protocol=777 server_address="localhost" server_port=25565 username="Notch" uuid=069a79f4-44e9-4726-a5be-fca90e38aaf5 ` + timing,
+			want: `INFO  \S+ login attempt: protocol=777 host="localhost" port=25565 rule=0 server=test username="Notch" uuid=069a79f4-44e9-4726-a5be-fca90e38aaf5 ` + timing,
 		},
 		{
 			name:   "login without username",
 			client: func(c *client) { c.handshake(5, modernproto.IntentLogin); c.readPacket(modernproto.LoginDisconnectID) },
-			want:   `INFO  \S+ login attempt: protocol=5 server_address="localhost" server_port=25565 ` + timing,
+			want:   `INFO  \S+ login attempt: protocol=5 host="localhost" port=25565 rule=0 server=test ` + timing,
 		},
 		{
 			name: "transfer",
@@ -79,18 +81,18 @@ func TestLogging(t *testing.T) {
 				c.handshake(1518, modernproto.IntentTransfer)
 				c.readPacket(modernproto.LoginDisconnectID)
 			},
-			want: `INFO  \S+ transfer attempt: protocol=1518 server_address="localhost" server_port=25565 ` + timing,
+			want: `INFO  \S+ transfer attempt: protocol=1518 host="localhost" port=25565 rule=0 server=test ` + timing,
 		},
 		{
 			name:   "timeout",
 			client: func(c *client) { c.statusExchange(777); c.expectClosed() },
-			want:   `INFO  \S+ server list ping: protocol=777 server_address="localhost" server_port=25565 ping_request=false ` + timing + ` error="reading ping request: read tcp .*: i/o timeout"`,
+			want:   `INFO  \S+ server list ping: protocol=777 host="localhost" port=25565 rule=0 server=test ping_request=false ` + timing + ` error="reading ping request: read tcp .*: i/o timeout"`,
 		},
 		{
 			name:          "proxied",
 			proxyProtocol: true,
 			client:        func(c *client) { c.write(proxyHeader("192.0.2.1:56324")); c.statusExchange(777) },
-			want:          `INFO  \[192\.0\.2\.1\]:56324 server list ping: proxy=127\.0\.0\.1 protocol=777 server_address="localhost" server_port=25565 ping_request=false ` + timing,
+			want:          `INFO  \[192\.0\.2\.1\]:56324 server list ping: proxy=127\.0\.0\.1 protocol=777 host="localhost" port=25565 rule=0 server=test ping_request=false ` + timing,
 		},
 		{
 			name:   "invalid",
@@ -120,17 +122,17 @@ func TestLogging(t *testing.T) {
 		{
 			name:   "legacy ping",
 			client: func(c *client) { c.write(legacyPing16); c.expectClosed() },
-			want:   `INFO  \S+ legacy server list ping: legacy_ping_version=1\.6 protocol=73 server_address="localhost" server_port=25565 ` + timing,
+			want:   `INFO  \S+ legacy server list ping: legacy_ping_version=1\.6 protocol=73 host="localhost" port=25565 rule=0 server=test ` + timing,
 		},
 		{
 			name:   "legacy login",
 			client: func(c *client) { c.write(legacyLogin13); c.expectClosed() },
-			want:   `INFO  \S+ legacy login attempt: protocol=78 server_address="localhost" server_port=25565 username="Notch" ` + timing,
+			want:   `INFO  \S+ legacy login attempt: protocol=78 host="localhost" port=25565 rule=0 server=test username="Notch" ` + timing,
 		},
 		{
 			name:   "legacy login before 1.3",
 			client: func(c *client) { c.write(legacyLoginBeta); c.expectClosed() },
-			want:   `INFO  \S+ legacy login attempt: protocol=-1 server_address="localhost" server_port=25565 username="Notch" ` + timing,
+			want:   `INFO  \S+ legacy login attempt: protocol=-1 host="localhost" port=25565 rule=0 server=test username="Notch" ` + timing,
 		},
 		{
 			name:   "empty",
@@ -184,7 +186,7 @@ func TestLoggingLegacyPingWithoutProtocolVersion(t *testing.T) {
 	_ = c.conn.Close()
 	stop()
 
-	want := `INFO  \S+ legacy server list ping: legacy_ping_version=1\.4-1\.5 protocol=-1 duration=\S+`
+	want := `INFO  \S+ legacy server list ping: legacy_ping_version=1\.4-1\.5 protocol=-1 rule=0 server=test duration=\S+`
 	if !regexp.MustCompile(`(?m)^\[\S+\] ` + want + `$`).MatchString(logs.String()) {
 		t.Errorf("logs = %q, want a line matching %q", logs.String(), want)
 	}
@@ -266,5 +268,24 @@ func TestLogLimiter(t *testing.T) {
 	}
 	if dropped, _ := l.allow(second.Add(time.Second)); !dropped.Equal(slog.Attr{}) {
 		t.Errorf("allow() reported %v again", dropped)
+	}
+}
+
+// Statuses are logged with the rule that answered, the first one that applies,
+// and its server.
+func TestLoggingRuleOfStatus(t *testing.T) {
+	var logs bytes.Buffer
+	cfg := testConfig
+	cfg.Servers = maps.Clone(cfg.Servers)
+	cfg.Servers["lobby"] = VirtualServer{Status: mustParseStatus(t, `{"description":"Lobby"}`), Kick: json.RawMessage(testKick)}
+	cfg.Rules = []Rule{{Name: "0", Server: "lobby"}, {Name: "default", Server: testServerID}}
+	addr, stop := startServerWithLogger(t, cfg, slog.New(logging.NewTextHandler(&logs, nil)))
+	c := dial(t, addr)
+	c.statusExchange(777)
+	_ = c.conn.Close()
+	stop()
+
+	if want := " rule=0 server=lobby ping_request=false "; !strings.Contains(logs.String(), want) {
+		t.Errorf("logs = %q, want them to contain %q", logs.String(), want)
 	}
 }
