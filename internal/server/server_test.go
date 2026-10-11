@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"net"
 	"os"
@@ -20,23 +21,52 @@ import (
 	"time"
 	"unicode/utf16"
 
+	"github.com/nathan818fr/fake-minecraft-server/internal/condition"
 	"github.com/nathan818fr/fake-minecraft-server/internal/modernproto"
+	"github.com/nathan818fr/fake-minecraft-server/internal/status"
 )
 
 const clientTimeout = 2 * time.Second
 
-var testConfig = Config{
-	KickMessage:     json.RawMessage(`{"text":"Go away"}`),
-	MOTD:            json.RawMessage(`{"text":"Hello"}`),
-	Favicon:         "data:image/png;base64,AAAA",
-	MaxPlayers:      20,
-	OnlinePlayers:   3,
-	VersionName:     "Fake 1.0",
-	ProtocolVersion: 47,
+const testStatus = `{"version":{"name":"Fake 1.0","protocol":47},"players":{"max":20,"online":3,"sample":[]},` +
+	`"description":{"text":"Hello"},"favicon":"data:image/png;base64,AAAA"}`
+
+// testKick is the kick message of the virtual server of testConfig.
+const testKick = `{"text":"Go away"}`
+
+var testConfig = withStatus(Config{
 	// Both longer than the client timeout, so that tests only see deliberate
 	// closes.
 	ConnectionTimeout: time.Minute,
 	HandshakeTimeout:  time.Minute,
+}, testStatus)
+
+// testServerID is the ID of the virtual server of testConfig, which its single
+// rule targets, and which answers its status as it is.
+const testServerID = "test"
+
+func withStatus(cfg Config, data string) Config {
+	st, err := status.Parse([]byte(data))
+	if err != nil {
+		panic(err)
+	}
+	cfg.Servers = map[string]VirtualServer{testServerID: {Status: st, ClientProtocol: ClientProtocolNever, Kick: json.RawMessage(testKick)}}
+	cfg.Rules = []Rule{{Name: "0", Server: testServerID}}
+	return cfg
+}
+
+func withClientProtocol(cfg Config, clientProtocol ClientProtocol) Config {
+	return withServer(cfg, func(server *VirtualServer) { server.ClientProtocol = clientProtocol })
+}
+
+// withServer returns cfg with its virtual server testServerID changed by
+// change, and its servers copied so that cfg can be changed further.
+func withServer(cfg Config, change func(*VirtualServer)) Config {
+	cfg.Servers = maps.Clone(cfg.Servers)
+	server := cfg.Servers[testServerID]
+	change(&server)
+	cfg.Servers[testServerID] = server
+	return cfg
 }
 
 func startServer(t testing.TB, cfg Config) string {
@@ -129,9 +159,14 @@ func (c *client) write(data []byte) {
 
 func (c *client) handshake(protocolVersion int32, intent modernproto.Intent) {
 	c.t.Helper()
+	c.handshakeTo("localhost", protocolVersion, intent)
+}
+
+func (c *client) handshakeTo(host string, protocolVersion int32, intent modernproto.Intent) {
+	c.t.Helper()
 	c.write(modernproto.AppendHandshake(nil, modernproto.Handshake{
 		ProtocolVersion: protocolVersion,
-		ServerAddress:   "localhost",
+		ServerAddress:   host,
 		ServerPort:      25565,
 		Intent:          intent,
 	}))
@@ -162,11 +197,11 @@ func (c *client) readString(id byte) string {
 
 func (c *client) readStatus() map[string]json.RawMessage {
 	c.t.Helper()
-	var status map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(c.readString(modernproto.StatusResponseID)), &status); err != nil {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(c.readString(modernproto.StatusResponseID)), &fields); err != nil {
 		c.t.Fatalf("decoding status: %v", err)
 	}
-	return status
+	return fields
 }
 
 // expectClosed asserts that the server closed the connection before the
@@ -220,22 +255,20 @@ func (c *client) statusExchange(protocolVersion int32) map[string]json.RawMessag
 
 func TestStatus(t *testing.T) {
 	c := dial(t, startServer(t, testConfig))
-	status := c.statusExchange(777)
+	got := c.statusExchange(777)
 
 	want := map[string]string{
 		"version":     `{"name":"Fake 1.0","protocol":47}`,
 		"players":     `{"max":20,"online":3,"sample":[]}`,
 		"description": `{"text":"Hello"}`,
 		"favicon":     `"data:image/png;base64,AAAA"`,
-
-		"fakeMinecraftServer": "true",
 	}
-	if len(status) != len(want) {
-		t.Errorf("status has fields %v, want %v", status, want)
+	if len(got) != len(want) {
+		t.Errorf("status has fields %v, want %v", got, want)
 	}
 	for key, value := range want {
-		if string(status[key]) != value {
-			t.Errorf("status %s = %s, want %s", key, status[key], value)
+		if string(got[key]) != value {
+			t.Errorf("status %s = %s, want %s", key, got[key], value)
 		}
 	}
 
@@ -247,19 +280,157 @@ func TestStatus(t *testing.T) {
 	c.expectClosed()
 }
 
-func TestStatusWithoutFavicon(t *testing.T) {
-	cfg := testConfig
-	cfg.Favicon = ""
-	status := dial(t, startServer(t, cfg)).statusExchange(777)
-	if _, ok := status["favicon"]; ok {
-		t.Errorf("status has a favicon: %s", status["favicon"])
+// The status is sent as configured, with the fields that the server does not
+// read.
+func TestStatusIsSentAsConfigured(t *testing.T) {
+	const want = `{"description":"Hi","enforcesSecureChat":true,"forgeData":{"fmlNetworkVersion":3}}`
+	c := dial(t, startServer(t, withStatus(testConfig, want)))
+	c.handshake(777, modernproto.IntentStatus)
+	c.write(modernproto.AppendPacket(nil, modernproto.StatusRequestID, nil))
+	if got := c.readString(modernproto.StatusResponseID); got != want {
+		t.Errorf("status = %s, want %s", got, want)
 	}
 }
 
-func TestStatusMirrorsClientProtocolVersion(t *testing.T) {
-	cfg := testConfig
-	cfg.MirrorProtocolVersion = true
-	addr := startServer(t, cfg)
+// Signed statuses get the member that identifies this software, unless they
+// have their own.
+func TestStatusSignature(t *testing.T) {
+	for data, want := range map[string]string{
+		`{"description":"Hi"}`:              `{"description":"Hi","fakeMinecraftServer":true}`,
+		`{}`:                                `{"fakeMinecraftServer":true}`,
+		`{"fakeMinecraftServer":"lobby-2"}`: `{"fakeMinecraftServer":"lobby-2"}`,
+	} {
+		cfg := withStatus(testConfig, data)
+		cfg.SoftwareSignature = true
+		c := dial(t, startServer(t, cfg))
+		c.handshake(777, modernproto.IntentStatus)
+		c.write(modernproto.AppendPacket(nil, modernproto.StatusRequestID, nil))
+		if got := c.readString(modernproto.StatusResponseID); got != want {
+			t.Errorf("status %s: got %s, want %s", data, got, want)
+		}
+	}
+}
+
+// withConditionRules returns cfg with the servers "a" and "b", and a rule with
+// conditions for each one, before the rule of its server testServerID.
+func withConditionRules(cfg Config, condsA, condsB []condition.Condition) Config {
+	cfg.Servers = maps.Clone(cfg.Servers)
+	for _, id := range []string{"a", "b"} {
+		st, err := status.Parse([]byte(`{"description":"Server ` + id + `"}`))
+		if err != nil {
+			panic(err)
+		}
+		cfg.Servers[id] = VirtualServer{Status: st, ClientProtocol: ClientProtocolNever, Kick: json.RawMessage(`"Kick ` + id + `"`)}
+	}
+	cfg.Rules = []Rule{{Name: "a", Conditions: condsA, Server: "a"}, {Name: "b", Conditions: condsB, Server: "b"}, {Name: "0", Server: testServerID}}
+	return cfg
+}
+
+// withHostRules is like withConditionRules, with conditions on the hosts, or
+// none for nil.
+func withHostRules(t *testing.T, cfg Config, hostsA, hostsB []string) Config {
+	t.Helper()
+	conds := func(patterns []string) []condition.Condition {
+		if patterns == nil {
+			return nil
+		}
+		c, err := condition.Hosts(patterns)
+		if err != nil {
+			t.Fatalf("Hosts(%q) error: %v", patterns, err)
+		}
+		return []condition.Condition{c}
+	}
+	return withConditionRules(cfg, conds(hostsA), conds(hostsB))
+}
+
+// Rules with hosts apply to the clients that connected to one of them, in any
+// case, with or without a trailing dot, and whatever modded clients add after
+// the host.
+func TestRuleHosts(t *testing.T) {
+	addr := startServer(t, withHostRules(t, testConfig, []string{"play.a.com"}, []string{"*.b.com", ".c.com"}))
+	tests := []struct {
+		host string
+		want string // The server.
+	}{
+		{"play.a.com", "a"},
+		{"PLAY.A.com.", "a"},
+		{"play.a.com\x00FML3\x00", "a"},
+		{"x.b.com", "b"},
+		{"y.x.b.com", "b"},
+		{"b.com", ""},
+		{"c.com", "b"},
+		{"x.y.c.com", "b"},
+		{"xc.com", ""},
+		{"play.a.com.example", ""},
+		{"", ""},
+	}
+	for _, tc := range tests {
+		wantStatus, wantKick := `{"text":"Hello"}`, testKick
+		if tc.want != "" {
+			wantStatus, wantKick = `"Server `+tc.want+`"`, `"Kick `+tc.want+`"`
+		}
+		c := dial(t, addr)
+		c.handshakeTo(tc.host, 777, modernproto.IntentStatus)
+		c.write(modernproto.AppendPacket(nil, modernproto.StatusRequestID, nil))
+		if got := c.readStatus()["description"]; string(got) != wantStatus {
+			t.Errorf("host %q: description = %s, want %s", tc.host, got, wantStatus)
+		}
+		c = dial(t, addr)
+		c.handshakeTo(tc.host, 777, modernproto.IntentLogin)
+		if got := c.readString(modernproto.LoginDisconnectID); got != wantKick {
+			t.Errorf("host %q: kick message = %s, want %s", tc.host, got, wantKick)
+		}
+	}
+}
+
+// Legacy clients match rules with hosts too, from 1.6 for pings and 1.3 for
+// logins: older ones send no host, and match none.
+func TestRuleHostsOfLegacyClients(t *testing.T) {
+	addr := startServer(t, withHostRules(t, testConfig, []string{"localhost"}, nil))
+	c := dial(t, addr)
+	c.write(legacyPing16)
+	if got := c.readLegacyResponse(); !strings.Contains(got, "Server a") {
+		t.Errorf("legacy ping response = %q, want the status of server a", got)
+	}
+	c = dial(t, addr)
+	c.write(legacyLogin13)
+	if got := c.readLegacyResponse(); got != "Kick a" {
+		t.Errorf("legacy kick message = %q, want %q", got, "Kick a")
+	}
+	c = dial(t, addr)
+	c.write([]byte{0xfe, 0x01})
+	if got := c.readLegacyResponse(); !strings.Contains(got, "Server b") {
+		t.Errorf("legacy ping response without host = %q, want the status of server b", got)
+	}
+}
+
+// By default, statuses report the protocol version of each client, unless
+// they have one that no client has, which clients show as incompatible with
+// the version name.
+func TestClientProtocol(t *testing.T) {
+	tests := []struct {
+		clientProtocol ClientProtocol
+		version        string
+		want           string
+	}{
+		{ClientProtocolAuto, `{"name":"Fake","protocol":47}`, `{"name":"Fake","protocol":777}`},
+		{ClientProtocolAuto, `{"name":"Fake","protocol":4}`, `{"name":"Fake","protocol":777}`},
+		{ClientProtocolAuto, `{"name":"§cMaintenance","protocol":-1}`, `{"name":"§cMaintenance","protocol":-1}`},
+		{ClientProtocolAuto, `{"name":"§cMaintenance","protocol":0}`, `{"name":"§cMaintenance","protocol":0}`},
+		{ClientProtocolAuto, `{"name":"§cMaintenance","protocol":1}`, `{"name":"§cMaintenance","protocol":1}`},
+		{ClientProtocolAlways, `{"name":"§cMaintenance","protocol":-1}`, `{"name":"§cMaintenance","protocol":777}`},
+		{ClientProtocolNever, `{"name":"Fake","protocol":47}`, `{"name":"Fake","protocol":47}`},
+	}
+	for _, tc := range tests {
+		cfg := withClientProtocol(withStatus(testConfig, `{"version":`+tc.version+`}`), tc.clientProtocol)
+		if got := dial(t, startServer(t, cfg)).statusExchange(777)["version"]; string(got) != tc.want {
+			t.Errorf("ClientProtocol %d with %s: version = %s, want %s", tc.clientProtocol, tc.version, got, tc.want)
+		}
+	}
+}
+
+func TestStatusUsesClientProtocolVersion(t *testing.T) {
+	addr := startServer(t, withClientProtocol(testConfig, ClientProtocolAlways))
 
 	// 1.7.10, 26.3, a 26.1 snapshot and the lowest possible value.
 	for _, version := range []int32{5, 777, 0x4000011f, math.MinInt32} {
@@ -267,6 +438,41 @@ func TestStatusMirrorsClientProtocolVersion(t *testing.T) {
 		if want := fmt.Sprintf(`{"name":"Fake 1.0","protocol":%d}`, version); string(got) != want {
 			t.Errorf("version = %s, want %s", got, want)
 		}
+	}
+}
+
+// Using the protocol version of the client adds a version to statuses that
+// have none, so that clients still see the server as compatible.
+func TestStatusUsesClientProtocolVersionWithoutVersion(t *testing.T) {
+	cfg := withClientProtocol(withStatus(testConfig, `{"description":"Hi"}`), ClientProtocolAuto)
+	got := dial(t, startServer(t, cfg)).statusExchange(777)["version"]
+	if want := `{"name":"","protocol":777}`; string(got) != want {
+		t.Errorf("version = %s, want %s", got, want)
+	}
+}
+
+// Joins get the kick message of the server of the first rule, even if it has no
+// status, and pings the status of the next one.
+func TestKickOfServer(t *testing.T) {
+	cfg := testConfig
+	cfg.Servers = maps.Clone(cfg.Servers)
+	cfg.Servers["closed"] = VirtualServer{Kick: json.RawMessage(`{"text":"Closed"}`)}
+	cfg.Rules = []Rule{{Server: "closed"}, {Server: testServerID}}
+	addr := startServer(t, cfg)
+
+	c := dial(t, addr)
+	c.handshake(777, modernproto.IntentLogin)
+	c.write(modernproto.AppendPacket(nil, 0x00, modernproto.AppendString(nil, "Steve")))
+	if got, want := c.readString(modernproto.LoginDisconnectID), `{"text":"Closed"}`; got != want {
+		t.Errorf("kick message = %s, want %s", got, want)
+	}
+	c = dial(t, addr)
+	c.write(legacyLogin13)
+	if got := c.readLegacyResponse(); got != "Closed" {
+		t.Errorf("legacy kick message = %q, want %q", got, "Closed")
+	}
+	if got := dial(t, addr).statusExchange(777)["description"]; string(got) != `{"text":"Hello"}` {
+		t.Errorf("description = %s, want the one of the next rule", got)
 	}
 }
 
@@ -278,8 +484,8 @@ func TestLoginIsKicked(t *testing.T) {
 			c.handshake(777, intent)
 			c.write(modernproto.AppendPacket(nil, 0x00, modernproto.AppendString(nil, "Steve")))
 
-			if got := c.readString(modernproto.LoginDisconnectID); got != string(testConfig.KickMessage) {
-				t.Errorf("kick message = %s, want %s", got, testConfig.KickMessage)
+			if got := c.readString(modernproto.LoginDisconnectID); got != testKick {
+				t.Errorf("kick message = %s, want %s", got, testKick)
 			}
 			c.expectClosed()
 		})
@@ -292,28 +498,35 @@ var legacyPing16 = []byte("\xfe\x01\xfa\x00\x0b\x00M\x00C\x00|\x00P\x00i\x00n\x0
 
 func TestLegacyPing(t *testing.T) {
 	tests := []struct {
-		name   string
-		ping   []byte
-		mirror bool
-		want   string
+		name           string
+		ping           []byte
+		clientProtocol ClientProtocol
+		want           string
 	}{
-		{"beta to 1.3", []byte{0xfe}, false, "Hello§3§20"},
-		{"1.4 to 1.5", []byte{0xfe, 0x01}, false, "§1\x0047\x00Fake 1.0\x00Hello\x003\x0020"},
-		{"1.4 to 1.5 with mirrored protocol version", []byte{0xfe, 0x01}, true, "§1\x0061\x00Fake 1.0\x00Hello\x003\x0020"},
-		{"1.6", legacyPing16, false, "§1\x0047\x00Fake 1.0\x00Hello\x003\x0020"},
-		{"1.6 with mirrored protocol version", legacyPing16, true, "§1\x0073\x00Fake 1.0\x00Hello\x003\x0020"},
+		{"beta to 1.3", []byte{0xfe}, ClientProtocolNever, "Hello§3§20"},
+		{"1.4 to 1.5", []byte{0xfe, 0x01}, ClientProtocolNever, "§1\x0047\x00Fake 1.0\x00Hello\x003\x0020"},
+		{"1.4 to 1.5 with the client's protocol version", []byte{0xfe, 0x01}, ClientProtocolAlways, "§1\x0061\x00Fake 1.0\x00Hello\x003\x0020"},
+		{"1.6", legacyPing16, ClientProtocolNever, "§1\x0047\x00Fake 1.0\x00Hello\x003\x0020"},
+		{"1.6 with the client's protocol version", legacyPing16, ClientProtocolAlways, "§1\x0073\x00Fake 1.0\x00Hello\x003\x0020"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := testConfig
-			cfg.MirrorProtocolVersion = tc.mirror
-			c := dial(t, startServer(t, cfg))
+			c := dial(t, startServer(t, withClientProtocol(testConfig, tc.clientProtocol)))
 			c.write(tc.ping)
 
 			if got := c.readLegacyResponse(); got != tc.want {
 				t.Errorf("response = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// Statuses may lack any field, which legacy clients get as empty or zero.
+func TestLegacyPingOfEmptyStatus(t *testing.T) {
+	c := dial(t, startServer(t, withStatus(testConfig, `{}`)))
+	c.write(legacyPing16)
+	if got, want := c.readLegacyResponse(), "§1\x000\x00\x00\x000\x000"; got != want {
+		t.Errorf("response = %q, want %q", got, want)
 	}
 }
 
@@ -367,10 +580,8 @@ func TestFragmentedLegacyPing(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := testConfig
-			// The mirrored protocol version shows which ping was read.
-			cfg.MirrorProtocolVersion = true
-			c := dial(t, startServer(t, cfg))
+			// The protocol version of the client shows which ping was read.
+			c := dial(t, startServer(t, withClientProtocol(testConfig, ClientProtocolAlways)))
 			c.write(tc.ping[:tc.split])
 			time.Sleep(100 * time.Millisecond)
 			c.write(tc.ping[tc.split:])
@@ -548,12 +759,27 @@ func TestNewRejectsInvalidConfig(t *testing.T) {
 		cfg  func(*Config)
 	}{
 		{"oversized status", func(cfg *Config) {
-			cfg.Favicon = "data:image/png;base64," + strings.Repeat("A", modernproto.MaxStatusResponseLength)
+			*cfg = withStatus(*cfg, `{"favicon":"data:image/png;base64,`+strings.Repeat("A", modernproto.MaxStatusResponseLength)+`"}`)
 		}},
-		{"oversized kick message", func(cfg *Config) {
-			cfg.KickMessage = json.RawMessage(`"` + strings.Repeat("a", modernproto.MaxDisconnectReasonLength) + `"`)
+		{"no rules", func(cfg *Config) { cfg.Rules = nil }},
+		{"rule with an unknown server", func(cfg *Config) { cfg.Rules = []Rule{{Server: "other"}, {Server: testServerID}} }},
+		{"last rule with a server without status", func(cfg *Config) {
+			cfg.Servers = maps.Clone(cfg.Servers)
+			cfg.Servers["lobby"] = VirtualServer{Kick: json.RawMessage(testKick)}
+			cfg.Rules = []Rule{{Server: testServerID}, {Server: "lobby"}}
 		}},
-		{"invalid MOTD", func(cfg *Config) { cfg.MOTD = json.RawMessage(`{`) }},
+		{"oversized kick message of a server", func(cfg *Config) {
+			*cfg = withServer(*cfg, func(server *VirtualServer) {
+				server.Kick = json.RawMessage(`"` + strings.Repeat("a", modernproto.MaxDisconnectReasonLength) + `"`)
+			})
+		}},
+		{"server without a kick message", func(cfg *Config) {
+			*cfg = withServer(*cfg, func(server *VirtualServer) { server.Kick = nil })
+		}},
+		{"last rule with conditions", func(cfg *Config) {
+			hosts, _ := condition.Hosts([]string{"a.com"})
+			cfg.Rules = []Rule{{Conditions: []condition.Condition{hosts}, Server: testServerID}}
+		}},
 		{"zero connection timeout", func(cfg *Config) { cfg.ConnectionTimeout = 0 }},
 		{"zero handshake timeout", func(cfg *Config) { cfg.HandshakeTimeout = 0 }},
 	}
@@ -568,10 +794,51 @@ func TestNewRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
+type recordingConn struct {
+	net.Conn
+	written []byte
+}
+
+func (c *recordingConn) Write(p []byte) (int, error) {
+	c.written = append(c.written, p...)
+	return len(p), nil
+}
+
+// The limit of status responses is in UTF-16 code units, not bytes, and clients
+// reject longer ones.
+func TestWriteStatusLength(t *testing.T) {
+	tests := []struct {
+		name        string
+		description string
+		signed      bool
+		fits        bool
+	}{
+		{"longer in bytes only", strings.Repeat("§", modernproto.MaxStatusResponseLength-100), false, true},
+		{"too long", strings.Repeat("a", modernproto.MaxStatusResponseLength), false, false},
+		// Of the longest length, without the signature: {"description":"…"}.
+		{"longest", strings.Repeat("a", modernproto.MaxStatusResponseLength-18), false, true},
+		{"too long with the signature", strings.Repeat("a", modernproto.MaxStatusResponseLength-18), true, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st, err := status.Parse([]byte(`{"description":"` + tc.description + `"}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn := &recordingConn{}
+			err = writeStatus(conn, st, tc.signed)
+			if tc.fits && (err != nil || len(conn.written) == 0) {
+				t.Errorf("writeStatus() error = %v, wrote %d bytes, want the status", err, len(conn.written))
+			}
+			if !tc.fits && (err == nil || !strings.HasPrefix(err.Error(), "writing status: too long:") || len(conn.written) != 0) {
+				t.Errorf("writeStatus() error = %v, wrote %d bytes, want a length error and nothing", err, len(conn.written))
+			}
+		})
+	}
+}
+
 func BenchmarkStatusExchange(b *testing.B) {
-	cfg := testConfig
-	cfg.Favicon = "data:image/png;base64," + strings.Repeat("A", 8000)
-	addr := startServer(b, cfg)
+	addr := startServer(b, withStatus(testConfig, strings.Replace(testStatus, "AAAA", strings.Repeat("A", 8000), 1)))
 	request := modernproto.AppendHandshake(nil, modernproto.Handshake{ProtocolVersion: 777, ServerAddress: "localhost", ServerPort: 25565, Intent: modernproto.IntentStatus})
 	request = modernproto.AppendPacket(request, modernproto.StatusRequestID, nil)
 	ping := modernproto.AppendPacket(nil, modernproto.PingRequestID, make([]byte, 8))

@@ -136,14 +136,23 @@ func TestAppendPingResponse(t *testing.T) {
 	}
 }
 
-// The MOTD is shortened to fit the length limit, rather than the player counts.
-func TestAppendPingResponseShortensMOTD(t *testing.T) {
-	response := AppendPingResponse(nil, Ping16, Status{VersionName: "x", MOTD: strings.Repeat("a", 300)})
-	if length := int(response[1])<<8 | int(response[2]); length != maxKickLength {
-		t.Errorf("response of %d code units, want %d", length, maxKickLength)
-	}
-	if !bytes.HasSuffix(response, mustHex(t, "0000 00300000 0030")) {
-		t.Errorf("response does not end with the player counts: %x", response[len(response)-16:])
+// The MOTD and the version name are shortened to fit the length limit, rather
+// than the player counts, which clients need to parse the response.
+func TestAppendPingResponseShortensFields(t *testing.T) {
+	long := strings.Repeat("a", 300)
+	for name, status := range map[string]Status{
+		"long MOTD":         {VersionName: "x", MOTD: long},
+		"long version name": {VersionName: long, MOTD: "x"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := AppendPingResponse(nil, Ping16, status)
+			if length := int(response[1])<<8 | int(response[2]); length != maxKickLength {
+				t.Errorf("response of %d code units, want %d", length, maxKickLength)
+			}
+			if !bytes.HasSuffix(response, mustHex(t, "0000 00300000 0030")) {
+				t.Errorf("response does not end with the player counts: %x", response[len(response)-16:])
+			}
+		})
 	}
 }
 

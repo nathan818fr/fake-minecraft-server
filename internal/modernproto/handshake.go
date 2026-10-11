@@ -11,6 +11,8 @@ import (
 
 type Intent int32
 
+// The intents of handshakes. Transfers (1.20.5+) are logins of players sent by
+// another server.
 const (
 	IntentStatus   Intent = 1
 	IntentLogin    Intent = 2

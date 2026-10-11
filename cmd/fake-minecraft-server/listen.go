@@ -11,12 +11,13 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/nathan818fr/fake-minecraft-server/internal/config"
 	"github.com/nathan818fr/fake-minecraft-server/internal/server"
 )
 
-// listen opens a listener on each address, with options. If one fails, it
-// closes the others, so that the server starts on all its addresses or none.
-func listen(ctx context.Context, addrs []listenAddr, options server.ListenerOptions) ([]server.Listener, error) {
+// listen opens a listener on each address. If one fails, it closes the
+// others, so that the server starts on all its addresses or none.
+func listen(ctx context.Context, addrs []config.Listener) ([]server.Listener, error) {
 	listenConfig := net.ListenConfig{
 		// Connections are short-lived and bounded by the connection timeout,
 		// so TCP keep-alive would only cost timers.
@@ -26,16 +27,16 @@ func listen(ctx context.Context, addrs []listenAddr, options server.ListenerOpti
 	for _, addr := range addrs {
 		var ln net.Listener
 		var err error
-		if addr.network == "unix" {
-			ln, err = listenUnix(ctx, &listenConfig, addr.address)
+		if addr.Network == "unix" {
+			ln, err = listenUnix(ctx, &listenConfig, addr.Address)
 		} else {
-			ln, err = listenConfig.Listen(ctx, addr.network, addr.address)
+			ln, err = listenConfig.Listen(ctx, addr.Network, addr.Address)
 		}
 		if err != nil {
 			closeAll(listeners)
 			return nil, err
 		}
-		listeners = append(listeners, server.Listener{Listener: ln, Options: options})
+		listeners = append(listeners, server.Listener{Listener: ln, Options: addr.Options})
 	}
 	return listeners, nil
 }

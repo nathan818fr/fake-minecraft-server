@@ -6,7 +6,8 @@ COPY . .
 ARG TARGETOS TARGETARCH
 # The version that the server logs at startup, passed by "mise run image".
 ARG VERSION
-RUN --mount=type=cache,target=/root/.cache/go-build \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o /out/fake-minecraft-server ./cmd/fake-minecraft-server
 

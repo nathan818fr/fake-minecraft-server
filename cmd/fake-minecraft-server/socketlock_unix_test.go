@@ -9,20 +9,20 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nathan818fr/fake-minecraft-server/internal/server"
+	"github.com/nathan818fr/fake-minecraft-server/internal/config"
 )
 
 // A second server cannot take the socket of a running one, only take it over
 // once it stops.
 func TestListenLocksSocket(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "server.sock")
-	addrs := []listenAddr{{"unix", path}}
-	first, err := listen(context.Background(), addrs, server.ListenerOptions{})
+	addrs := []config.Listener{{Network: "unix", Address: path}}
+	first, err := listen(context.Background(), addrs)
 	if err != nil {
 		t.Fatalf("listen() error: %v", err)
 	}
 
-	if listeners, err := listen(context.Background(), addrs, server.ListenerOptions{}); err == nil || !strings.Contains(err.Error(), "another server uses it") {
+	if listeners, err := listen(context.Background(), addrs); err == nil || !strings.Contains(err.Error(), "another server uses it") {
 		closeAll(listeners)
 		t.Fatalf("second listen() error = %v, want the socket locked", err)
 	}
@@ -31,7 +31,7 @@ func TestListenLocksSocket(t *testing.T) {
 	}
 
 	closeAll(first)
-	again, err := listen(context.Background(), addrs, server.ListenerOptions{})
+	again, err := listen(context.Background(), addrs)
 	if err != nil {
 		t.Fatalf("listen() after the first server stopped: %v", err)
 	}
@@ -48,8 +48,8 @@ func TestListenRefusesSymlinkedLock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	addrs := []listenAddr{{"unix", path}}
-	if listeners, err := listen(context.Background(), addrs, server.ListenerOptions{}); err == nil {
+	addrs := []config.Listener{{Network: "unix", Address: path}}
+	if listeners, err := listen(context.Background(), addrs); err == nil {
 		closeAll(listeners)
 		t.Fatal("listen() succeeded, want an error")
 	}

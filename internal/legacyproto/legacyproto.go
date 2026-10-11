@@ -9,6 +9,7 @@
 package legacyproto
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -69,6 +70,16 @@ func encodeUTF16(s string, maxLength int) []uint16 {
 	return units
 }
 
+func utf16Length(s string) int {
+	return len(utf16.Encode([]rune(s)))
+}
+
+// shortenUTF16 returns s cut to maxLength UTF-16 code units, without splitting
+// a surrogate pair.
+func shortenUTF16(s string, maxLength int) string {
+	return string(utf16.Decode(encodeUTF16(s, maxLength)))
+}
+
 // readString reads a UTF-16BE string prefixed with its length in code units.
 func readString(r io.Reader, maxLength int) (string, error) {
 	var length uint16
@@ -87,34 +98,43 @@ func readString(r io.Reader, maxLength int) (string, error) {
 
 // TextFromComponent converts a JSON text component to legacy text: its texts,
 // formatted with the § codes they contain, but without the styles defined in
-// JSON.
+// JSON. Missing (nil) or invalid components have no text.
 func TextFromComponent(component json.RawMessage) string {
 	var b strings.Builder
 	appendComponentText(&b, component)
 	return b.String()
 }
 
+// appendComponentText decodes component once, as the kind its first byte
+// tells.
 func appendComponentText(b *strings.Builder, component json.RawMessage) {
-	var text string
-	if json.Unmarshal(component, &text) == nil {
-		b.WriteString(text)
+	component = bytes.TrimLeft(component, " \t\r\n")
+	if len(component) == 0 {
 		return
 	}
-	var list []json.RawMessage
-	if json.Unmarshal(component, &list) == nil {
-		for _, c := range list {
-			appendComponentText(b, c)
+	switch component[0] {
+	case '"':
+		var text string
+		if json.Unmarshal(component, &text) == nil {
+			b.WriteString(text)
 		}
-		return
-	}
-	var object struct {
-		Text  string            `json:"text"`
-		Extra []json.RawMessage `json:"extra"`
-	}
-	if json.Unmarshal(component, &object) == nil {
-		b.WriteString(object.Text)
-		for _, c := range object.Extra {
-			appendComponentText(b, c)
+	case '[':
+		var list []json.RawMessage
+		if json.Unmarshal(component, &list) == nil {
+			for _, c := range list {
+				appendComponentText(b, c)
+			}
+		}
+	case '{':
+		var object struct {
+			Text  string            `json:"text"`
+			Extra []json.RawMessage `json:"extra"`
+		}
+		if json.Unmarshal(component, &object) == nil {
+			b.WriteString(object.Text)
+			for _, c := range object.Extra {
+				appendComponentText(b, c)
+			}
 		}
 	}
 }

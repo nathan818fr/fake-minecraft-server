@@ -35,6 +35,10 @@ func TestTextFromComponent(t *testing.T) {
 		{`{"text":"§eHello\n§dWorld"}`, "§eHello\n§dWorld"},
 		{`{"text":"A","extra":[{"text":"B","bold":true},"C",["D"]]}`, "ABCD"},
 		{`"plain"`, "plain"},
+		{" \n" + `{"text":"spaced"}`, "spaced"},
+		{`{"text":"invalid"`, ""},
+		{`42`, ""},
+		{``, ""},
 	}
 	for _, tc := range tests {
 		if got := TextFromComponent([]byte(tc.component)); got != tc.want {

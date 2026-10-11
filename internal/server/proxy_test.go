@@ -99,6 +99,14 @@ func TestProxyProtocolTrustedProxies(t *testing.T) {
 	}
 }
 
+// Link-local proxies are trusted, despite the zone of their address.
+func TestProxyProtocolTrustedLinkLocalProxy(t *testing.T) {
+	options := ListenerOptions{ProxyProtocol: true, TrustedProxies: []netip.Prefix{netip.MustParsePrefix("fe80::/10")}}
+	if !options.isTrustedProxy(netip.MustParseAddrPort("[fe80::1%eth0]:25565")) {
+		t.Errorf("isTrustedProxy(%s) = false, want true", "[fe80::1%eth0]:25565")
+	}
+}
+
 // Each listener has its own options: only the ones with the PROXY protocol
 // require a header.
 func TestProxyProtocolPerListener(t *testing.T) {

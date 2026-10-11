@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"unicode/utf16"
 )
 
 const (
@@ -149,7 +148,7 @@ func readPingHost(r *bufio.Reader, ping *Ping) error {
 	if err != nil {
 		return err
 	}
-	if int(dataLength) != pingHostFixedLength+2*len(utf16.Encode([]rune(address))) {
+	if int(dataLength) != pingHostFixedLength+2*utf16Length(address) {
 		return fmt.Errorf("data length %d does not match its content", dataLength)
 	}
 
@@ -170,25 +169,24 @@ type Status struct {
 }
 
 // AppendPingResponse appends the response to a ping of the given version: a
-// kick packet holding the status. The MOTD is shortened if needed to fit the
-// length limit.
+// kick packet holding the status. To fit the length limit, the MOTD, then the
+// version name, are shortened if needed, so that the other fields stay whole.
 func AppendPingResponse(b []byte, version PingVersion, s Status) []byte {
 	online := strconv.Itoa(int(s.OnlinePlayers))
 	maxPlayers := strconv.Itoa(int(s.MaxPlayers))
 
-	var head, motd, tail string
 	if version == PingBeta {
 		// Fields are separated by §, so the MOTD cannot have formatting codes.
-		motd = stripFormatting(s.MOTD)
-		tail = "§" + online + "§" + maxPlayers
-	} else {
-		head = pingResponsePrefix + "\x00" + strconv.Itoa(int(s.ProtocolVersion)) + "\x00" + s.VersionName + "\x00"
-		motd = s.MOTD
-		tail = "\x00" + online + "\x00" + maxPlayers
+		tail := "§" + online + "§" + maxPlayers
+		motd := shortenUTF16(stripFormatting(s.MOTD), maxKickLength-utf16Length(tail))
+		return AppendKick(b, motd+tail)
 	}
-	room := max(maxKickLength-len(utf16.Encode([]rune(head+tail))), 0)
-	motd = string(utf16.Decode(encodeUTF16(motd, room)))
-	return AppendKick(b, head+motd+tail)
+	head := pingResponsePrefix + "\x00" + strconv.Itoa(int(s.ProtocolVersion)) + "\x00"
+	tail := "\x00" + online + "\x00" + maxPlayers
+	room := maxKickLength - utf16Length(head+"\x00"+tail)
+	motd := shortenUTF16(s.MOTD, room)
+	versionName := shortenUTF16(s.VersionName, room-utf16Length(motd))
+	return AppendKick(b, head+versionName+"\x00"+motd+tail)
 }
 
 // MOTDFromComponent converts a modern MOTD, a JSON text component, to the

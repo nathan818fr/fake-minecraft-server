@@ -10,6 +10,7 @@ import (
 	"runtime/debug"
 	"syscall"
 
+	"github.com/nathan818fr/fake-minecraft-server/internal/config"
 	"github.com/nathan818fr/fake-minecraft-server/internal/logging"
 	"github.com/nathan818fr/fake-minecraft-server/internal/server"
 )
@@ -31,20 +32,20 @@ func main() {
 }
 
 func run() error {
-	cfg, err := loadConfig(os.LookupEnv)
+	cfg, err := config.Load(os.Environ())
+	if cfg.LogFormat != "" {
+		// Errors returned from now on, including the ones of the other
+		// settings, are logged in the configured format too.
+		slog.SetDefault(slog.New(logging.NewHandler(os.Stdout, cfg.LogFormat, cfg.LogLevel)))
+	}
 	if err != nil {
 		return err
 	}
 
-	logger := slog.New(logging.NewHandler(os.Stdout, cfg.logFormat, cfg.logLevel))
-	// Errors returned from now on are logged in the configured format too.
-	slog.SetDefault(logger)
+	logger := slog.Default()
 	logger.Info("starting", "version", currentVersion())
-	for _, warning := range cfg.warnings {
-		logger.Warn(warning)
-	}
 
-	srv, err := server.New(cfg.server, logger)
+	srv, err := server.New(cfg.Server, logger)
 	if err != nil {
 		return err
 	}
@@ -55,7 +56,7 @@ func run() error {
 	// one kills the server without waiting for its connections.
 	context.AfterFunc(ctx, stop)
 
-	listeners, err := listen(ctx, cfg.listenAddrs, cfg.listenerOptions)
+	listeners, err := listen(ctx, cfg.Listeners)
 	if err != nil {
 		return err
 	}
