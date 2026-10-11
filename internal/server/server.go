@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 	"syscall"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/nathan818fr/fake-minecraft-server/internal/legacyproto"
 	"github.com/nathan818fr/fake-minecraft-server/internal/logging"
 	"github.com/nathan818fr/fake-minecraft-server/internal/modernproto"
+	"github.com/nathan818fr/fake-minecraft-server/internal/proxyproto"
 )
 
 // acceptRetryDelay paces retries after accept errors, such as running out of
@@ -54,22 +56,50 @@ type Config struct {
 	// positive.
 	ConnectionTimeout time.Duration
 	// HandshakeTimeout bounds the wait for the handshake (or legacy ping or
-	// login) of a client, with the request sent along with it. Clients send all
-	// of it as soon as they connect, so a limit shorter than ConnectionTimeout
-	// frees the connections that send nothing or too little sooner, which makes
-	// the server harder to flood. It must be positive.
+	// login) of a client, with its PROXY protocol header and the request sent
+	// along with it. Clients send all of it as soon as they connect, so a limit
+	// shorter than ConnectionTimeout frees the slots of connections that send
+	// nothing or too little, which makes the server harder to flood. It must be
+	// positive.
 	HandshakeTimeout time.Duration
+
+	// MaxConnections and MaxConnectionsPerIP bound the number of concurrent
+	// connections. Connections over the limits are reset as soon as they are
+	// identified. 0 means unlimited. MaxConnectionsPerIP counts IPv6 clients
+	// per /64 prefix rather than per address, and does not apply to Unix
+	// socket peers, which have no address (see clientLimiter).
+	MaxConnections      int
+	MaxConnectionsPerIP int
 
 	// LogRateLimit bounds the number of lines logged per second about
 	// connections. 0 means unlimited.
 	LogRateLimit int
 }
 
+// Listener is a listener of the server, with the options of the connections
+// that it accepts.
+type Listener struct {
+	net.Listener
+	Options ListenerOptions
+}
+
+type ListenerOptions struct {
+	// ProxyProtocol requires every connection to start with a PROXY protocol
+	// header, whose source address then identifies the client.
+	ProxyProtocol bool
+	// TrustedProxies holds the addresses of the TCP peers allowed to send
+	// PROXY protocol headers. Unix socket peers always are (see
+	// isTrustedProxy).
+	TrustedProxies []netip.Prefix
+}
+
 type Server struct {
 	cfg    Config
 	logger *slog.Logger
 
-	logLimiter logLimiter
+	connLimiter   semaphore
+	clientLimiter *clientLimiter
+	logLimiter    logLimiter
 
 	// Encoded once, as they are the same for every client.
 	kickPacket       []byte
@@ -101,7 +131,9 @@ func New(cfg Config, logger *slog.Logger) (*Server, error) {
 		cfg:    cfg,
 		logger: logger,
 
-		logLimiter: logLimiter{perSecond: cfg.LogRateLimit},
+		connLimiter:   newSemaphore(cfg.MaxConnections),
+		clientLimiter: newClientLimiter(cfg.MaxConnectionsPerIP),
+		logLimiter:    logLimiter{perSecond: cfg.LogRateLimit},
 
 		kickPacket:       modernproto.AppendPacket(nil, modernproto.LoginDisconnectID, modernproto.AppendString(nil, string(cfg.KickMessage))),
 		legacyKickPacket: legacyproto.AppendKick(nil, legacyproto.TextFromComponent(cfg.KickMessage)),
@@ -113,8 +145,8 @@ func New(cfg Config, logger *slog.Logger) (*Server, error) {
 
 // Serve accepts connections on the listeners until ctx is canceled or one of
 // them fails, then closes them all and waits for the remaining connections to
-// finish.
-func (s *Server) Serve(ctx context.Context, listeners ...net.Listener) error {
+// finish. The limits apply to all the listeners together.
+func (s *Server) Serve(ctx context.Context, listeners ...Listener) error {
 	if len(listeners) == 0 {
 		return errors.New("no listener to serve")
 	}
@@ -125,7 +157,11 @@ func (s *Server) Serve(ctx context.Context, listeners ...net.Listener) error {
 
 	errs := make(chan error, len(listeners))
 	for _, ln := range listeners {
-		s.logger.Info("listening", "listener", listenerAddr(ln))
+		var proxyProtocol slog.Attr
+		if ln.Options.ProxyProtocol {
+			proxyProtocol = slog.Bool("proxy_protocol", true)
+		}
+		s.logger.LogAttrs(ctx, slog.LevelInfo, "listening", slog.String("listener", listenerAddr(ln)), proxyProtocol)
 		go func() { errs <- s.accept(ctx, ln, len(listeners) > 1, &conns) }()
 	}
 
@@ -149,8 +185,8 @@ func (s *Server) Serve(ctx context.Context, listeners ...net.Listener) error {
 // accept accepts connections on ln until ctx is canceled, then closes ln. It
 // returns the error of ln if it fails before. Logs show the address of ln if
 // logListener.
-func (s *Server) accept(ctx context.Context, ln net.Listener, logListener bool, conns *sync.WaitGroup) error {
-	listener := listenerInfo{addr: listenerAddr(ln), logged: logListener}
+func (s *Server) accept(ctx context.Context, ln Listener, logListener bool, conns *sync.WaitGroup) error {
+	listener := listenerInfo{addr: listenerAddr(ln), logged: logListener, ListenerOptions: ln.Options}
 	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
 	defer stop()
 
@@ -168,16 +204,26 @@ func (s *Server) accept(ctx context.Context, ln net.Listener, logListener bool, 
 			continue
 		}
 
-		conns.Go(func() { s.handle(conn, listener) })
+		if !s.connLimiter.tryAcquire() {
+			abort(conn)
+			c := newConnInfo(conn, listener)
+			s.logRejected("connection rejected: too many connections", &c)
+			continue
+		}
+		conns.Go(func() {
+			defer s.connLimiter.release()
+			s.handle(conn, listener)
+		})
 	}
 }
 
 // listenerInfo is what connections know about the listener that accepted
-// them: its address (see listenerAddr), and whether logs show it, which they do
-// with several listeners.
+// them: its address (see listenerAddr), whether logs show it, which they do
+// with several listeners, and its options.
 type listenerInfo struct {
 	addr   string
 	logged bool
+	ListenerOptions
 }
 
 // listenerAddr returns the address of ln as host:port, or unix:path for Unix
@@ -213,7 +259,7 @@ func (sess *session) identified() bool {
 }
 
 func (s *Server) handle(conn net.Conn, listener listenerInfo) {
-	sess := session{conn: connInfo{start: time.Now(), remote: peerAddr(conn), listener: listener}}
+	sess := session{conn: newConnInfo(conn, listener)}
 	c := &sess.conn
 	connDeadline := c.start.Add(s.cfg.ConnectionTimeout)
 	handshakeDeadline := earliest(c.start.Add(s.cfg.HandshakeTimeout), connDeadline)
@@ -228,6 +274,25 @@ func (s *Server) handle(conn net.Conn, listener listenerInfo) {
 		connBuffersPool.Put(buffers)
 	}()
 
+	if listener.ProxyProtocol {
+		client, err := readProxyHeader(c, buffers.reader)
+		if err != nil {
+			abort(conn)
+			s.logInvalid(c, buffers.head, err)
+			return
+		}
+		c.remote, c.unknownClient = client, false
+		buffers.head.restart(buffers.reader) // Log what the client sent, not the header.
+	}
+
+	client := c.remote.Addr()
+	if !s.clientLimiter.acquire(client) {
+		abort(conn)
+		s.logRejected("connection rejected: too many connections from this address", c)
+		return
+	}
+	defer s.clientLimiter.release(client)
+
 	err := s.exchange(conn, buffers, &sess, handshakeDeadline, connDeadline)
 	if err != nil {
 		abort(conn)
@@ -240,6 +305,39 @@ func (s *Server) handle(conn net.Conn, listener listenerInfo) {
 		return
 	}
 	s.logSession(&sess, err)
+}
+
+// readProxyHeader reads the PROXY protocol header that the peer of c sends,
+// if it is a trusted proxy, and returns the address of the client, or the
+// proxy's own address for headers that carry none, such as health checks.
+func readProxyHeader(c *connInfo, r *bufio.Reader) (netip.AddrPort, error) {
+	if !c.proxied {
+		return netip.AddrPort{}, errors.New("not a trusted proxy, see trusted_proxies")
+	}
+	client, err := proxyproto.ReadHeader(r)
+	if err != nil {
+		return netip.AddrPort{}, fmt.Errorf("reading PROXY protocol header: %w", err)
+	}
+	if !client.IsValid() {
+		return c.peer, nil
+	}
+	return unmapAddrPort(client), nil
+}
+
+// isTrustedProxy reports whether peer may send PROXY protocol headers. Unix
+// socket peers always may: enabling the PROXY protocol on a Unix socket trusts
+// whoever can connect to it.
+func (o ListenerOptions) isTrustedProxy(peer netip.AddrPort) bool {
+	if isUnixPeer(peer) {
+		return true
+	}
+	addr := peer.Addr()
+	for _, prefix := range o.TrustedProxies {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // awaitLegacyPing waits briefly for the rest of what may be a legacy ping, so

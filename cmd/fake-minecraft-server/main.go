@@ -55,7 +55,7 @@ func run() error {
 	// one kills the server without waiting for its connections.
 	context.AfterFunc(ctx, stop)
 
-	listeners, err := listen(ctx, cfg.listenAddrs)
+	listeners, err := listen(ctx, cfg.listenAddrs, cfg.listenerOptions)
 	if err != nil {
 		return err
 	}

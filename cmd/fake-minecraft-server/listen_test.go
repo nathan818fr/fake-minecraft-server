@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/nathan818fr/fake-minecraft-server/internal/server"
 )
 
 func TestListenReplacesStaleSocket(t *testing.T) {
@@ -18,7 +20,7 @@ func TestListenReplacesStaleSocket(t *testing.T) {
 	stale.SetUnlinkOnClose(false)
 	_ = stale.Close()
 
-	listeners, err := listen(context.Background(), []listenAddr{{"unix", path}})
+	listeners, err := listen(context.Background(), []listenAddr{{"unix", path}}, server.ListenerOptions{})
 	if err != nil {
 		t.Fatalf("listen() error: %v", err)
 	}
@@ -33,7 +35,7 @@ func TestListenKeepsSocketInUse(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = inUse.Close() })
 
-	if listeners, err := listen(context.Background(), []listenAddr{{"unix", path}}); err == nil {
+	if listeners, err := listen(context.Background(), []listenAddr{{"unix", path}}, server.ListenerOptions{}); err == nil {
 		closeAll(listeners)
 		t.Fatal("listen() succeeded, want an error")
 	}
@@ -47,7 +49,7 @@ func TestListenClosesAllOnError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "server.sock")
 	invalid := filepath.Join(t.TempDir(), "missing", "server.sock")
 
-	if listeners, err := listen(context.Background(), []listenAddr{{"unix", path}, {"unix", invalid}}); err == nil {
+	if listeners, err := listen(context.Background(), []listenAddr{{"unix", path}, {"unix", invalid}}, server.ListenerOptions{}); err == nil {
 		closeAll(listeners)
 		t.Fatal("listen() succeeded, want an error")
 	}
