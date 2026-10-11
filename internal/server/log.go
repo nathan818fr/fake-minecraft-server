@@ -15,14 +15,6 @@ import (
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/modernproto"
 )
 
-// maxLoggedBytes bounds the number of bytes received from invalid connections
-// that are logged, to help identify them.
-const maxLoggedBytes = 64
-
-// loggedDurationPrecision is the precision of logged durations: finer digits
-// would only be noise.
-const loggedDurationPrecision = 100 * time.Microsecond
-
 // unixPeer is logged in place of the address of Unix socket peers, which have
 // none.
 const unixPeer = "unix"
@@ -55,8 +47,8 @@ func newConnInfo(conn net.Conn, listener listenerInfo) connInfo {
 
 // maxLineAttrs is the room for the attributes of a line about a connection,
 // kept on the stack so that making a line does not allocate them: the
-// longest, a login behind a proxy, has 12.
-const maxLineAttrs = 12
+// longest, a login behind a proxy, has 14.
+const maxLineAttrs = 14
 
 // appendAddrs appends the attributes holding the addresses of the connection.
 func (c *connInfo) appendAddrs(attrs []slog.Attr) []slog.Attr {
@@ -109,6 +101,7 @@ func (s *Server) logSession(sess *session, err error) {
 		if ping.HasHost {
 			line = appendHostAttrs(line, ping.ServerAddress, "", ping.ServerPort)
 		}
+		line = appendRuleAttrs(line, sess)
 
 	case sess.legacyLogin != nil:
 		login := sess.legacyLogin
@@ -117,6 +110,7 @@ func (s *Server) logSession(sess *session, err error) {
 		if login.HasHost {
 			line = appendHostAttrs(line, login.ServerAddress, "", login.ServerPort)
 		}
+		line = appendRuleAttrs(line, sess)
 		line = append(line, optionalUntrusted("username", login.Username))
 
 	default:
@@ -124,6 +118,7 @@ func (s *Server) logSession(sess *session, err error) {
 		msg = eventMessage(h.Intent)
 		line = append(line, slog.Int("protocol", int(h.ProtocolVersion)))
 		line = appendHostAttrs(line, h.ServerAddress, h.ServerAddressExtra, h.ServerPort)
+		line = appendRuleAttrs(line, sess)
 		if h.Intent == modernproto.IntentStatus {
 			line = append(line, slog.Bool("ping_request", sess.sentPingRequest))
 		} else {
@@ -136,7 +131,13 @@ func (s *Server) logSession(sess *session, err error) {
 // appendHostAttrs appends the attributes of the server address and port that
 // the client sent (see modernproto.Handshake).
 func appendHostAttrs(attrs []slog.Attr, host, extra string, port uint16) []slog.Attr {
-	return append(attrs, logging.Untrusted("server_address", host), optionalUntrusted("server_address_extra", extra), slog.Int("server_port", int(port)))
+	return append(attrs, logging.Untrusted("host", host), optionalUntrusted("host_extra", extra), slog.Int("port", int(port)))
+}
+
+// appendRuleAttrs appends the attributes telling which rule and virtual
+// server answered sess, if any.
+func appendRuleAttrs(attrs []slog.Attr, sess *session) []slog.Attr {
+	return append(attrs, optionalString("rule", sess.rule), optionalString("server", sess.server))
 }
 
 // eventMessage returns the log message for a handshake with the given intent,
@@ -182,7 +183,7 @@ func (s *Server) allowConnection() (slog.Attr, bool) {
 // which starts with its addresses (see appendAddrs), then how long it lasted,
 // dropped and how it ended.
 func (s *Server) logConnection(msg string, c *connInfo, line []slog.Attr, dropped slog.Attr, err error) {
-	line = append(line, slog.Duration("duration", roundDuration(time.Since(c.start))), dropped)
+	line = append(line, logging.Duration("duration", time.Since(c.start)), dropped)
 	if err != nil {
 		line = append(line, logging.Error(err))
 	}
@@ -222,14 +223,12 @@ func optionalUntrusted(key, value string) slog.Attr {
 	return logging.Untrusted(key, value)
 }
 
-func roundDuration(d time.Duration) time.Duration {
-	return d.Round(loggedDurationPrecision)
-}
-
 // headRecorder reads from r and keeps a copy of the first bytes read.
 type headRecorder struct {
-	r   io.Reader
-	buf [maxLoggedBytes]byte
+	r io.Reader
+	// buf holds as many bytes as logs show of untrusted values, to help
+	// identify invalid connections.
+	buf [logging.MaxUntrustedLength]byte
 	n   int
 }
 

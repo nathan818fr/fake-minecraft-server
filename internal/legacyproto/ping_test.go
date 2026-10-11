@@ -3,11 +3,13 @@ package legacyproto
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"io"
 	"strings"
 	"testing"
+	"unicode/utf16"
 )
 
 func mustHex(t *testing.T, s string) []byte {
@@ -136,15 +138,46 @@ func TestAppendPingResponse(t *testing.T) {
 	}
 }
 
-// The MOTD is shortened to fit the length limit, rather than the player counts.
-func TestAppendPingResponseShortensMOTD(t *testing.T) {
-	response := AppendPingResponse(nil, Ping16, Status{VersionName: "x", MOTD: strings.Repeat("a", 300)})
-	if length := int(response[1])<<8 | int(response[2]); length != maxKickLength {
-		t.Errorf("response of %d code units, want %d", length, maxKickLength)
+// The version name and the MOTD are shortened to fit the length limit, rather
+// than the player counts, which clients need to parse the response. The
+// version name keeps up to half of the room, or what the MOTD leaves.
+func TestAppendPingResponseShortensFields(t *testing.T) {
+	long := strings.Repeat("a", 300)
+	// Without "§1\x000\x00" before them, "\x00" between them, and "\x000\x000"
+	// after them.
+	const room = maxKickLength - 10
+	for _, tc := range []struct {
+		name              string
+		status            Status
+		versionName, motd int
+	}{
+		{"long MOTD", Status{VersionName: "x", MOTD: long}, 1, room - 1},
+		{"long version name", Status{VersionName: long, MOTD: "x"}, room - 1, 1},
+		{"both long", Status{VersionName: long, MOTD: long}, room / 2, room - room/2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := AppendPingResponse(nil, Ping16, tc.status)
+			if length := int(response[1])<<8 | int(response[2]); length != maxKickLength {
+				t.Errorf("response of %d code units, want %d", length, maxKickLength)
+			}
+			if !bytes.HasSuffix(response, mustHex(t, "0000 00300000 0030")) {
+				t.Errorf("response does not end with the player counts: %x", response[len(response)-16:])
+			}
+			fields := strings.Split(kickText(response), "\x00")
+			if len(fields[2]) != tc.versionName || len(fields[3]) != tc.motd {
+				t.Errorf("version name of %d characters and MOTD of %d, want %d and %d", len(fields[2]), len(fields[3]), tc.versionName, tc.motd)
+			}
+		})
 	}
-	if !bytes.HasSuffix(response, mustHex(t, "0000 00300000 0030")) {
-		t.Errorf("response does not end with the player counts: %x", response[len(response)-16:])
+}
+
+// kickText returns the text of a kick packet.
+func kickText(packet []byte) string {
+	units := make([]uint16, (len(packet)-3)/2)
+	for i := range units {
+		units[i] = binary.BigEndian.Uint16(packet[3+2*i:])
 	}
+	return string(utf16.Decode(units))
 }
 
 func TestMOTDFromComponent(t *testing.T) {

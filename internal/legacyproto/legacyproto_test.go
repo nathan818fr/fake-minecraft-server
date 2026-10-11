@@ -2,7 +2,6 @@ package legacyproto
 
 import (
 	"encoding/hex"
-	"slices"
 	"strings"
 	"testing"
 )
@@ -18,11 +17,10 @@ func TestAppendKick(t *testing.T) {
 }
 
 // Text cut to the length limit must not end with half of a surrogate pair.
-func TestEncodeUTF16(t *testing.T) {
-	want := encodeUTF16("😀😀", 4)
+func TestShortenUTF16(t *testing.T) {
 	for _, maxLength := range []int{4, 5} {
-		if units := encodeUTF16("😀😀😀", maxLength); !slices.Equal(units, want) {
-			t.Errorf("encodeUTF16(%d) = %x, want %x", maxLength, units, want)
+		if got := shortenUTF16("😀😀😀", maxLength); got != "😀😀" {
+			t.Errorf("shortenUTF16(%d) = %q, want %q", maxLength, got, "😀😀")
 		}
 	}
 }
@@ -49,6 +47,10 @@ func TestTextFromComponent(t *testing.T) {
 		{`{"text":"§eHello\n§dWorld"}`, "§eHello\n§dWorld"},
 		{`{"text":"A","extra":[{"text":"B","bold":true},"C",["D"]]}`, "ABCD"},
 		{`"plain"`, "plain"},
+		{" \n" + `{"text":"spaced"}`, "spaced"},
+		{`{"text":"invalid"`, ""},
+		{`42`, ""},
+		{``, ""},
 	}
 	for _, tc := range tests {
 		if got := TextFromComponent([]byte(tc.component)); got != tc.want {

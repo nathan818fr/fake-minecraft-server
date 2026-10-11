@@ -19,7 +19,7 @@ const RemoteKey = "remote"
 
 // TextHandler writes records as lines such as:
 //
-//	[2026-10-10T23:22:16.155Z] INFO  [192.0.2.1]:51006 server list ping: protocol=777 server_address="mc.example.com"
+//	[2026-10-10T23:22:16.155Z] INFO  [192.0.2.1]:51006 server list ping: protocol=777 host="mc.example.com" port=25565
 //
 // The time is in UTC, the remote address is written before the message, and
 // the other attributes after it. Values are quoted and escaped like Go
@@ -33,6 +33,8 @@ type TextHandler struct {
 	group string // Prefix of the keys, such as "a.b.".
 }
 
+// NewTextHandler returns a handler writing the records of level and above to w.
+// A nil level is slog.LevelInfo.
 func NewTextHandler(w io.Writer, level slog.Leveler) *TextHandler {
 	if level == nil {
 		level = slog.LevelInfo

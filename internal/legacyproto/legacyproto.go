@@ -9,6 +9,7 @@
 package legacyproto
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -36,37 +37,45 @@ const maxUsernameLength = 16
 // version: in logins before 1.3 and pings before 1.6.
 const unknownProtocolVersion = -1
 
-// High surrogates, the first half of surrogate pairs, take the code units from
-// highSurrogateStart up to lowSurrogateStart.
-const (
-	highSurrogateStart = 0xd800
-	lowSurrogateStart  = 0xdc00
-)
-
 // AppendKick appends a kick packet holding s, which disconnects legacy
-// clients with s as message, cut to their length limit.
+// clients with s as message, cut to their length limit. Invalid UTF-8 is sent
+// as U+FFFD.
 func AppendKick(b []byte, s string) []byte {
-	units := encodeUTF16(s, maxKickLength)
+	s = shortenUTF16(s, maxKickLength)
 	b = append(b, kickID)
-	b = binary.BigEndian.AppendUint16(b, uint16(len(units)))
-	for _, u := range units {
-		b = binary.BigEndian.AppendUint16(b, u)
+	b = binary.BigEndian.AppendUint16(b, uint16(utf16Length(s)))
+	for _, r := range s {
+		if utf16.RuneLen(r) == 2 {
+			high, low := utf16.EncodeRune(r)
+			b = binary.BigEndian.AppendUint16(b, uint16(high))
+			b = binary.BigEndian.AppendUint16(b, uint16(low))
+		} else {
+			b = binary.BigEndian.AppendUint16(b, uint16(r))
+		}
 	}
 	return b
 }
 
-// encodeUTF16 encodes s in at most maxLength UTF-16 code units, without
-// leaving half of a surrogate pair at the end.
-func encodeUTF16(s string, maxLength int) []uint16 {
-	units := utf16.Encode([]rune(s))
-	if len(units) <= maxLength {
-		return units
+// utf16Length returns the length of s in UTF-16 code units, with invalid UTF-8
+// as U+FFFD.
+func utf16Length(s string) int {
+	n := 0
+	for _, r := range s {
+		n += utf16.RuneLen(r)
 	}
-	units = units[:maxLength]
-	if last := len(units) - 1; last >= 0 && units[last] >= highSurrogateStart && units[last] < lowSurrogateStart {
-		units = units[:last]
+	return n
+}
+
+// shortenUTF16 returns s cut to maxLength UTF-16 code units, without splitting
+// a surrogate pair.
+func shortenUTF16(s string, maxLength int) string {
+	n := 0
+	for i, r := range s {
+		if n += utf16.RuneLen(r); n > maxLength {
+			return s[:i]
+		}
 	}
-	return units
+	return s
 }
 
 // readString reads a UTF-16BE string prefixed with its length in code units.
@@ -92,37 +101,43 @@ const maxComponentDepth = 64
 
 // TextFromComponent converts a JSON text component to legacy text: its texts,
 // formatted with the § codes they contain, but without the styles defined in
-// JSON.
+// JSON. Missing (nil) or invalid components have no text.
 func TextFromComponent(component json.RawMessage) string {
 	var b strings.Builder
 	appendComponentText(&b, component, 0)
 	return b.String()
 }
 
+// appendComponentText decodes component, at depth, once, as the kind its
+// first byte tells.
 func appendComponentText(b *strings.Builder, component json.RawMessage, depth int) {
-	if depth > maxComponentDepth {
+	component = bytes.TrimLeft(component, " \t\r\n")
+	if len(component) == 0 || depth > maxComponentDepth {
 		return
 	}
-	var text string
-	if json.Unmarshal(component, &text) == nil {
-		b.WriteString(text)
-		return
-	}
-	var list []json.RawMessage
-	if json.Unmarshal(component, &list) == nil {
-		for _, c := range list {
-			appendComponentText(b, c, depth+1)
+	switch component[0] {
+	case '"':
+		var text string
+		if json.Unmarshal(component, &text) == nil {
+			b.WriteString(text)
 		}
-		return
-	}
-	var object struct {
-		Text  string            `json:"text"`
-		Extra []json.RawMessage `json:"extra"`
-	}
-	if json.Unmarshal(component, &object) == nil {
-		b.WriteString(object.Text)
-		for _, c := range object.Extra {
-			appendComponentText(b, c, depth+1)
+	case '[':
+		var list []json.RawMessage
+		if json.Unmarshal(component, &list) == nil {
+			for _, c := range list {
+				appendComponentText(b, c, depth+1)
+			}
+		}
+	case '{':
+		var object struct {
+			Text  string            `json:"text"`
+			Extra []json.RawMessage `json:"extra"`
+		}
+		if json.Unmarshal(component, &object) == nil {
+			b.WriteString(object.Text)
+			for _, c := range object.Extra {
+				appendComponentText(b, c, depth+1)
+			}
 		}
 	}
 }

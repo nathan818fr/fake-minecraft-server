@@ -236,14 +236,32 @@ func TestUntrustedValuesCannotInjectContent(t *testing.T) {
 }
 
 func TestParseFormat(t *testing.T) {
-	for _, s := range []string{"text", "json"} {
-		if f, err := ParseFormat(s); err != nil || string(f) != s {
-			t.Errorf("ParseFormat(%q) = %q, %v", s, f, err)
+	for s, want := range map[string]Format{"text": FormatText, "json": FormatJSON} {
+		if f, err := ParseFormat(s); err != nil || f != want {
+			t.Errorf("ParseFormat(%q) = %q, %v, want %q", s, f, err, want)
 		}
 	}
-	for _, s := range []string{"", "JSON", "logfmt"} {
+	for _, s := range []string{"", "logfmt", "JSON"} {
 		if _, err := ParseFormat(s); err == nil {
 			t.Errorf("ParseFormat(%q) succeeded, want an error", s)
+		}
+	}
+}
+
+func TestShorten(t *testing.T) {
+	tests := []struct {
+		s    string
+		want string
+	}{
+		{"short", "short"},
+		{strings.Repeat("a", 64), strings.Repeat("a", 64)},
+		{strings.Repeat("a", 65), strings.Repeat("a", 64) + "..."},
+		// The cut falls in the middle of a "§", which is dropped.
+		{"a" + strings.Repeat("§", 40), "a" + strings.Repeat("§", 31) + "..."},
+	}
+	for _, tc := range tests {
+		if got := Shorten(tc.s); got != tc.want {
+			t.Errorf("Shorten(%q) = %q, want %q", tc.s, got, tc.want)
 		}
 	}
 }

@@ -5,7 +5,6 @@ package server
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/condition"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/legacyproto"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/logging"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/modernproto"
@@ -31,26 +31,13 @@ const acceptRetryDelay = 100 * time.Millisecond
 // (Beta 1.8 to 1.5) get their response that much later.
 const legacyPingWait = 500 * time.Millisecond
 
-// maxProtocolVersionTextLength is the length of the longest protocol version
-// written in the status.
-const maxProtocolVersionTextLength = len("-2147483648")
-
 type Config struct {
-	// KickMessage and MOTD are JSON text components.
-	KickMessage json.RawMessage
-	MOTD        json.RawMessage
-
-	// Favicon is a data URI of a 64x64 PNG image, or empty for none.
-	Favicon string
-
-	MaxPlayers    int32
-	OnlinePlayers int32
-
-	VersionName     string
-	ProtocolVersion int32
-	// MirrorProtocolVersion reports the client's own protocol version instead
-	// of ProtocolVersion, so that the server never appears as incompatible.
-	MirrorProtocolVersion bool
+	// Servers holds the virtual servers that the rules choose from, by ID.
+	Servers map[string]VirtualServer
+	// Rules tell which virtual server answers each client: the one of the
+	// first rule that applies. The last one must always apply, without
+	// conditions.
+	Rules []Rule
 
 	// ConnectionTimeout bounds the whole lifetime of a connection. It must be
 	// positive.
@@ -78,6 +65,11 @@ type Config struct {
 	// LogRateLimit bounds the number of lines logged per second about
 	// connections. 0 means unlimited.
 	LogRateLimit int
+
+	// SoftwareSignature adds the signature of this software to the statuses
+	// answered, so that it can be told from real servers (see
+	// signatureMember).
+	SoftwareSignature bool
 }
 
 // Listener is a listener of the server, with the options of the connections
@@ -105,31 +97,14 @@ type Server struct {
 	clientLimiter *clientLimiter
 	rateLimiter   rateLimiter
 	logLimiter    logLimiter
-
-	// Encoded once, as they are the same for every client.
-	kickPacket       []byte
-	legacyKickPacket []byte
-	legacyMOTD       string
-	// statusHead and statusTail surround the protocol version in the status
-	// JSON, which is the only part that may change between clients.
-	statusHead []byte
-	statusTail []byte
 }
 
 func New(cfg Config, logger *slog.Logger) (*Server, error) {
 	if cfg.ConnectionTimeout <= 0 || cfg.HandshakeTimeout <= 0 {
 		return nil, errors.New("connection and handshake timeouts must be positive")
 	}
-	if n := modernproto.UTF16Length(cfg.KickMessage); n > modernproto.MaxDisconnectReasonLength {
-		return nil, fmt.Errorf("kick message is too long: %d characters, the limit is %d", n, modernproto.MaxDisconnectReasonLength)
-	}
-	statusHead, statusTail, err := encodeStatus(cfg)
-	if err != nil {
+	if err := checkServers(&cfg); err != nil {
 		return nil, err
-	}
-	n := modernproto.UTF16Length(statusHead) + maxProtocolVersionTextLength + modernproto.UTF16Length(statusTail)
-	if n > modernproto.MaxStatusResponseLength {
-		return nil, fmt.Errorf("status is too long: %d characters, the limit is %d (is the favicon too large?)", n, modernproto.MaxStatusResponseLength)
 	}
 
 	return &Server{
@@ -140,12 +115,6 @@ func New(cfg Config, logger *slog.Logger) (*Server, error) {
 		clientLimiter: newClientLimiter(cfg.MaxConnectionsPerIP),
 		rateLimiter:   rateLimiter{rate: cfg.ConnectionRateLimitPerIP},
 		logLimiter:    logLimiter{perSecond: cfg.LogRateLimit},
-
-		kickPacket:       modernproto.AppendPacket(nil, modernproto.LoginDisconnectID, modernproto.AppendString(nil, string(cfg.KickMessage))),
-		legacyKickPacket: legacyproto.AppendKick(nil, legacyproto.TextFromComponent(cfg.KickMessage)),
-		legacyMOTD:       legacyproto.MOTDFromComponent(cfg.MOTD),
-		statusHead:       statusHead,
-		statusTail:       statusTail,
 	}, nil
 }
 
@@ -248,14 +217,44 @@ type session struct {
 	conn connInfo
 
 	handshake modernproto.Handshake
+	// rule is the name of the rule that answered, if any, and server the ID of
+	// its virtual server.
+	rule   string
+	server string
 	// sentPingRequest reports whether the client sent a ping request after the
 	// status request, to measure its latency.
 	sentPingRequest bool
-	// loginStart holds the username and UUID sent by clients trying to join.
-	loginStart modernproto.LoginStart
+	loginStart      modernproto.LoginStart
 	// legacyPing and legacyLogin hold what clients older than 1.7 sent, if any.
 	legacyPing  *legacyproto.Ping
 	legacyLogin *legacyproto.Login
+
+	// client is what conditions know about the client, made when first
+	// needed (see conditionClient).
+	client *condition.Client
+}
+
+// conditionClient returns what conditions know about the client of sess.
+func (sess *session) conditionClient() *condition.Client {
+	if sess.client != nil {
+		return sess.client
+	}
+	c := &condition.Client{Host: sess.host()}
+	sess.client = c
+	return c
+}
+
+// host returns the host that the client of sess connected to, or "" if it did
+// not send one.
+func (sess *session) host() string {
+	switch {
+	case sess.legacyPing != nil:
+		return sess.legacyPing.ServerAddress
+	case sess.legacyLogin != nil:
+		return sess.legacyLogin.ServerAddress
+	default:
+		return sess.handshake.ServerAddress
+	}
 }
 
 // readWhole reports whether the server read the whole request of the client
@@ -362,7 +361,8 @@ func (o ListenerOptions) isTrustedProxy(peer netip.AddrPort) bool {
 	if isUnixPeer(peer) {
 		return true
 	}
-	addr := peer.Addr()
+	// Prefixes never match addresses with a zone, which link-local peers have.
+	addr := peer.Addr().WithZone("")
 	for _, prefix := range o.TrustedProxies {
 		if prefix.Contains(addr) {
 			return true
@@ -425,10 +425,11 @@ func (s *Server) exchange(conn net.Conn, buffers *connBuffers, sess *session, ha
 
 	switch {
 	case sess.legacyPing != nil:
-		_, err := conn.Write(legacyproto.AppendPingResponse(nil, sess.legacyPing.Version, s.legacyStatus(*sess.legacyPing)))
+		legacy := legacyStatus(s.statusFor(sess))
+		_, err := conn.Write(legacyproto.AppendPingResponse(nil, sess.legacyPing.Version, legacy))
 		return err
 	case sess.legacyLogin != nil:
-		_, err := conn.Write(s.legacyKickPacket)
+		_, err := conn.Write(legacyproto.AppendKick(nil, legacyproto.TextFromComponent(s.serverFor(sess).Kick)))
 		return err
 	case sess.handshake.Intent == modernproto.IntentStatus:
 		return s.answerStatus(conn, buffers, sess, connDeadline)
@@ -436,7 +437,8 @@ func (s *Server) exchange(conn net.Conn, buffers *connBuffers, sess *session, ha
 		// Clients send a Login Start packet right after the handshake. It is
 		// only read for logging, after the kick, so that an invalid or missing
 		// one neither delays the kick nor aborts the connection.
-		if _, err := conn.Write(s.kickPacket); err != nil {
+		kick := modernproto.AppendString(nil, string(s.serverFor(sess).Kick))
+		if _, err := conn.Write(modernproto.AppendPacket(nil, modernproto.LoginDisconnectID, kick)); err != nil {
 			return err
 		}
 		sess.loginStart, _ = modernproto.ReadLoginStart(buffers.reader, sess.handshake.ProtocolVersion)
@@ -450,7 +452,7 @@ func (s *Server) answerStatus(conn net.Conn, buffers *connBuffers, sess *session
 	if err := modernproto.ReadPacketExact(buffers.reader, modernproto.StatusRequestID, nil); err != nil {
 		return fmt.Errorf("reading status request: %w", err)
 	}
-	if err := s.writeStatus(conn, sess.handshake.ProtocolVersion); err != nil {
+	if err := writeStatus(conn, s.statusFor(sess), s.cfg.SoftwareSignature); err != nil {
 		return err
 	}
 
