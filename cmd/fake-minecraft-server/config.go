@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/netip"
 	"os"
 	"slices"
 	"strconv"
@@ -21,19 +22,24 @@ import (
 
 // Environment variables read by loadConfig.
 const (
-	envListenAddr        = "LISTEN_ADDR"
-	envKickMessage       = "KICK_MESSAGE"
-	envMOTD              = "MOTD"
-	envFavicon           = "FAVICON"
-	envMaxPlayers        = "MAX_PLAYERS"
-	envOnlinePlayers     = "ONLINE_PLAYERS"
-	envProtocolName      = "PROTOCOL_NAME"
-	envProtocolVersion   = "PROTOCOL_VERSION"
-	envConnectionTimeout = "CONNECTION_TIMEOUT"
-	envHandshakeTimeout  = "HANDSHAKE_TIMEOUT"
-	envLogFormat         = "LOG_FORMAT"
-	envLogLevel          = "LOG_LEVEL"
-	envLogRateLimit      = "LOG_RATE_LIMIT"
+	envListenAddr               = "LISTEN_ADDR"
+	envKickMessage              = "KICK_MESSAGE"
+	envMOTD                     = "MOTD"
+	envFavicon                  = "FAVICON"
+	envMaxPlayers               = "MAX_PLAYERS"
+	envOnlinePlayers            = "ONLINE_PLAYERS"
+	envProtocolName             = "PROTOCOL_NAME"
+	envProtocolVersion          = "PROTOCOL_VERSION"
+	envConnectionTimeout        = "CONNECTION_TIMEOUT"
+	envHandshakeTimeout         = "HANDSHAKE_TIMEOUT"
+	envMaxConnections           = "MAX_CONNECTIONS"
+	envMaxConnectionsPerIP      = "MAX_CONNECTIONS_PER_IP"
+	envConnectionRateLimitPerIP = "CONNECTION_RATE_LIMIT_PER_IP"
+	envLogFormat                = "LOG_FORMAT"
+	envLogLevel                 = "LOG_LEVEL"
+	envLogRateLimit             = "LOG_RATE_LIMIT"
+	envProxyProtocol            = "PROXY_PROTOCOL"
+	envProxyProtocolTrusted     = "PROXY_PROTOCOL_TRUSTED"
 
 	// Deprecated: replaced by LISTEN_ADDR.
 	envListenHost = "LISTEN_HOST"
@@ -41,19 +47,26 @@ const (
 )
 
 const (
-	defaultPort              = 25565
-	defaultKickMessage       = "§cNot available"
-	defaultMOTD              = "§eHello World!"
-	defaultConnectionTimeout = 3 * time.Second
-	defaultHandshakeTimeout  = time.Second
-	defaultLogRateLimit      = 1000
-	defaultLogFormat         = logging.FormatText
-	defaultLogLevel          = slog.LevelInfo
+	defaultPort                = 25565
+	defaultKickMessage         = "§cNot available"
+	defaultMOTD                = "§eHello World!"
+	defaultConnectionTimeout   = 3 * time.Second
+	defaultHandshakeTimeout    = time.Second
+	defaultMaxConnections      = 10000
+	defaultMaxConnectionsPerIP = 8
+	defaultRateLimitPerIP      = 10
+	defaultLogRateLimit        = 1000
+	defaultLogFormat           = logging.FormatText
+	defaultLogLevel            = slog.LevelInfo
 )
 
 // clientProtocolVersion makes the server report the protocol version of each
 // client.
 const clientProtocolVersion = "client"
+
+// ipv4MappedPrefixBits is the length of the prefix of IPv4-mapped IPv6
+// addresses (::ffff:0:0/96), which hold the IPv4 address in their last 32 bits.
+const ipv4MappedPrefixBits = 96
 
 var pngSignature = []byte("\x89PNG\r\n\x1a\n")
 
@@ -62,9 +75,11 @@ const unixAddrPrefix = "unix:"
 
 type config struct {
 	listenAddrs []listenAddr
-	logFormat   logging.Format
-	logLevel    slog.Level
-	server      server.Config
+	// listenerOptions are the options of every listener.
+	listenerOptions server.ListenerOptions
+	logFormat       logging.Format
+	logLevel        slog.Level
+	server          server.Config
 	// warnings, such as uses of deprecated variables, are logged once the
 	// logger is configured.
 	warnings []string
@@ -96,24 +111,40 @@ func loadConfig(lookup func(string) (string, bool)) (config, error) {
 
 	cfg := config{
 		listenAddrs: env.getListenAddrs(),
-		logFormat:   env.getLogFormat(envLogFormat, defaultLogFormat),
-		logLevel:    env.getLogLevel(envLogLevel, defaultLogLevel),
+		listenerOptions: server.ListenerOptions{
+			ProxyProtocol:  env.getBool(envProxyProtocol, false),
+			TrustedProxies: env.getPrefixes(envProxyProtocolTrusted),
+		},
+		logFormat: env.getLogFormat(envLogFormat, defaultLogFormat),
+		logLevel:  env.getLogLevel(envLogLevel, defaultLogLevel),
 		server: server.Config{
-			KickMessage:           textComponent(env.get(envKickMessage, defaultKickMessage)),
-			MOTD:                  textComponent(env.get(envMOTD, defaultMOTD)),
-			Favicon:               env.getFavicon(envFavicon),
-			MaxPlayers:            env.getInt32(envMaxPlayers, 0),
-			OnlinePlayers:         env.getInt32(envOnlinePlayers, 0),
-			VersionName:           env.get(envProtocolName, ""),
-			ProtocolVersion:       protocolVersion,
-			MirrorProtocolVersion: mirrorProtocolVersion,
-			ConnectionTimeout:     connectionTimeout,
-			HandshakeTimeout:      handshakeTimeout,
-			LogRateLimit:          env.getInt(envLogRateLimit, defaultLogRateLimit, 0, math.MaxInt32),
+			KickMessage:              textComponent(env.get(envKickMessage, defaultKickMessage)),
+			MOTD:                     textComponent(env.get(envMOTD, defaultMOTD)),
+			Favicon:                  env.getFavicon(envFavicon),
+			MaxPlayers:               env.getInt32(envMaxPlayers, 0),
+			OnlinePlayers:            env.getInt32(envOnlinePlayers, 0),
+			VersionName:              env.get(envProtocolName, ""),
+			ProtocolVersion:          protocolVersion,
+			MirrorProtocolVersion:    mirrorProtocolVersion,
+			ConnectionTimeout:        connectionTimeout,
+			HandshakeTimeout:         handshakeTimeout,
+			MaxConnections:           env.getInt(envMaxConnections, defaultMaxConnections, 0, math.MaxInt32),
+			MaxConnectionsPerIP:      env.getInt(envMaxConnectionsPerIP, defaultMaxConnectionsPerIP, 0, math.MaxInt32),
+			ConnectionRateLimitPerIP: env.getInt(envConnectionRateLimitPerIP, defaultRateLimitPerIP, 0, math.MaxInt32),
+			LogRateLimit:             env.getInt(envLogRateLimit, defaultLogRateLimit, 0, math.MaxInt32),
 		},
 	}
 	if cfg.server.HandshakeTimeout > cfg.server.ConnectionTimeout {
 		env.fail(envHandshakeTimeout, fmt.Errorf("must not exceed %s", envConnectionTimeout))
+	}
+	if len(cfg.listenerOptions.TrustedProxies) > 0 && !cfg.listenerOptions.ProxyProtocol {
+		env.fail(envProxyProtocolTrusted, fmt.Errorf("requires %s=true", envProxyProtocol))
+	}
+	// Trusting any TCP peer must be explicit: anyone reaching the server could
+	// then send a header with a forged address.
+	tcp := slices.ContainsFunc(cfg.listenAddrs, func(a listenAddr) bool { return a.network == "tcp" })
+	if cfg.listenerOptions.ProxyProtocol && tcp && env.get(envProxyProtocolTrusted, "") == "" {
+		env.fail(envProxyProtocolTrusted, errors.New("must list the proxies allowed to send headers, such as 10.0.0.0/8, or 0.0.0.0/0,::/0 for any address"))
 	}
 	cfg.warnings = env.warnings
 	return cfg, errors.Join(env.errs...)
@@ -171,6 +202,19 @@ func (e *envReader) getDuration(key string, fallback time.Duration) time.Duratio
 		return fallback
 	}
 	return d
+}
+
+func (e *envReader) getBool(key string, fallback bool) bool {
+	value := e.get(key, "")
+	if value == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(value)
+	if err != nil {
+		e.fail(key, fmt.Errorf("must be true or false, got %q", value))
+		return fallback
+	}
+	return b
 }
 
 // getProtocolVersion returns the protocol version to report, or whether to
@@ -302,6 +346,49 @@ func (e *envReader) getFavicon(key string) string {
 		return ""
 	}
 	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(data)
+}
+
+// getPrefixes parses a comma-separated list of IP addresses and CIDR prefixes.
+func (e *envReader) getPrefixes(key string) []netip.Prefix {
+	var prefixes []netip.Prefix
+	for item := range strings.SplitSeq(e.get(key, ""), ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		prefix, err := parsePrefix(item)
+		if err != nil {
+			e.fail(key, err)
+			continue
+		}
+		prefixes = append(prefixes, prefix)
+	}
+	return prefixes
+}
+
+// parsePrefix parses an IP address, as a prefix of its full length, or a CIDR
+// prefix.
+func parsePrefix(s string) (netip.Prefix, error) {
+	var prefix netip.Prefix
+	var err error
+	if strings.Contains(s, "/") {
+		prefix, err = netip.ParsePrefix(s)
+	} else {
+		var addr netip.Addr
+		addr, err = netip.ParseAddr(s)
+		prefix = netip.PrefixFrom(addr, addr.BitLen())
+	}
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("%q is not an IP address or CIDR prefix", s)
+	}
+	// Client addresses are unmapped, so IPv4-mapped prefixes must be too.
+	if prefix.Addr().Is4In6() {
+		if prefix.Bits() < ipv4MappedPrefixBits {
+			return netip.Prefix{}, fmt.Errorf("%q is an IPv4-mapped prefix shorter than /%d", s, ipv4MappedPrefixBits)
+		}
+		prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-ipv4MappedPrefixBits)
+	}
+	return prefix.Masked(), nil
 }
 
 // textComponent returns s as is if it is a JSON object, and wraps it in a

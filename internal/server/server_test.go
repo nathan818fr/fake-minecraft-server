@@ -13,12 +13,15 @@ import (
 	"math"
 	"net"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf16"
 
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/logging"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/modernproto"
 )
 
@@ -48,16 +51,37 @@ func startServer(t testing.TB, cfg Config) string {
 // for its connections to finish.
 func startServerWithLogger(t testing.TB, cfg Config, logger *slog.Logger) (string, func()) {
 	t.Helper()
+	return startServerWithOptions(t, cfg, logger, ListenerOptions{})
+}
+
+// startServerWithOptions is like startServerWithLogger, with the options of
+// its listener.
+func startServerWithOptions(t testing.TB, cfg Config, logger *slog.Logger, options ListenerOptions) (string, func()) {
+	t.Helper()
+	ln := listenTCP(t)
+	return ln.Addr().String(), serve(t, cfg, logger, Listener{Listener: ln, Options: options})
+}
+
+// startProxiedServer is like startServer, with the PROXY protocol (see
+// testProxyProtocol).
+func startProxiedServer(t testing.TB, cfg Config) string {
+	t.Helper()
+	addr, _ := startServerWithOptions(t, cfg, slog.New(slog.DiscardHandler), testProxyProtocol)
+	return addr
+}
+
+func listenTCP(t testing.TB) net.Listener {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return ln.Addr().String(), serve(t, cfg, logger, ln)
+	return ln
 }
 
 // serve serves the listeners and returns a function that stops the server and
 // waits for its connections to finish.
-func serve(t testing.TB, cfg Config, logger *slog.Logger, listeners ...net.Listener) func() {
+func serve(t testing.TB, cfg Config, logger *slog.Logger, listeners ...Listener) func() {
 	t.Helper()
 	srv, err := New(cfg, logger)
 	if err != nil {
@@ -155,6 +179,66 @@ func (c *client) expectClosed() {
 	if errors.Is(err, os.ErrDeadlineExceeded) {
 		c.t.Fatal("server did not close the connection")
 	}
+}
+
+// holdConnection opens a connection to addr that the server counts in its
+// limits until it is closed: the server answered its status request, and waits
+// for a ping that it never sends.
+func holdConnection(t testing.TB, addr string) *client {
+	t.Helper()
+	c := dial(t, addr)
+	c.statusExchange(777)
+	return c
+}
+
+// expectAccepted asserts that a new connection to addr gets its status, within
+// clientTimeout: the server frees the place of a closed connection only once
+// it reads the close, so the first tries may be rejected.
+func expectAccepted(t testing.TB, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(clientTimeout)
+	for {
+		err := tryStatus(addr)
+		if err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("connection still rejected: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// tryStatus asks the server at addr for its status.
+func tryStatus(addr string) error {
+	conn, err := net.DialTimeout("tcp", addr, clientTimeout)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(clientTimeout))
+	request := modernproto.AppendHandshake(nil, modernproto.Handshake{ProtocolVersion: 777, ServerAddress: "localhost", ServerPort: 25565, Intent: modernproto.IntentStatus})
+	if _, err := conn.Write(modernproto.AppendPacket(request, modernproto.StatusRequestID, nil)); err != nil {
+		return err
+	}
+	_, err = modernproto.ReadPacket(bufio.NewReader(conn), modernproto.StatusResponseID, make([]byte, 1<<16))
+	return err
+}
+
+// expectRejected asserts that the server resets a new connection to addr
+// right away. The reset can arrive before the dial returns, which then fails.
+func expectRejected(t testing.TB, addr string) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", addr, clientTimeout)
+	if errors.Is(err, syscall.ECONNRESET) {
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(clientTimeout))
+	(&client{t: t, conn: conn, r: bufio.NewReader(conn)}).expectClosed()
 }
 
 // readLegacyResponse reads the response to a legacy ping until the server
@@ -411,13 +495,13 @@ func TestInvalidPing(t *testing.T) {
 }
 
 // Clients must send their handshake, with what comes along with it, by the
-// handshake timeout: it frees the connections that send nothing or too little
-// sooner than the connection timeout.
+// handshake timeout: it frees the slots of connections that send nothing or
+// too little sooner than the connection timeout.
 func TestHandshakeTimeout(t *testing.T) {
 	handshake := modernproto.AppendHandshake(nil, modernproto.Handshake{ProtocolVersion: 777, ServerAddress: "localhost", Intent: modernproto.IntentStatus})
 	tests := []struct {
 		name      string
-		cfg       func(*Config)
+		setup     func(*Config, *ListenerOptions)
 		data      []byte
 		closedAt  time.Duration
 		wantReply bool
@@ -425,19 +509,31 @@ func TestHandshakeTimeout(t *testing.T) {
 		{"silent", nil, nil, 200 * time.Millisecond, false},
 		{"partial handshake", nil, handshake[:4], 200 * time.Millisecond, false},
 		{"handshake without status request", nil, handshake, 200 * time.Millisecond, false},
-		{"connection timeout shorter", func(cfg *Config) { cfg.ConnectionTimeout = 100 * time.Millisecond }, nil, 100 * time.Millisecond, false},
+		{
+			"partial PROXY protocol header", func(_ *Config, options *ListenerOptions) { *options = testProxyProtocol },
+			proxyHeader("192.0.2.1:1")[:8], 200 * time.Millisecond, false,
+		},
+		{
+			"connection timeout shorter", func(cfg *Config, _ *ListenerOptions) { cfg.ConnectionTimeout = 100 * time.Millisecond },
+			nil, 100 * time.Millisecond, false,
+		},
 		// Shorter than the wait for the rest of a legacy ping, which ends with
 		// it.
-		{"beta legacy ping", func(cfg *Config) { cfg.HandshakeTimeout = 100 * time.Millisecond }, []byte{0xfe}, 100 * time.Millisecond, true},
+		{
+			"beta legacy ping", func(cfg *Config, _ *ListenerOptions) { cfg.HandshakeTimeout = 100 * time.Millisecond },
+			[]byte{0xfe}, 100 * time.Millisecond, true,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := testConfig
 			cfg.HandshakeTimeout = 200 * time.Millisecond
-			if tc.cfg != nil {
-				tc.cfg(&cfg)
+			var options ListenerOptions
+			if tc.setup != nil {
+				tc.setup(&cfg, &options)
 			}
-			c := dial(t, startServer(t, cfg))
+			addr, _ := startServerWithOptions(t, cfg, slog.New(slog.DiscardHandler), options)
+			c := dial(t, addr)
 			c.write(tc.data)
 
 			start := time.Now()
@@ -463,6 +559,97 @@ func TestPingAfterHandshakeTimeout(t *testing.T) {
 	time.Sleep(cfg.HandshakeTimeout + 200*time.Millisecond)
 	c.write(modernproto.AppendPacket(nil, modernproto.PingRequestID, make([]byte, 8)))
 	c.readPacket(modernproto.PongResponseID)
+}
+
+func TestConnectionLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  func(*Config)
+	}{
+		{"global", func(cfg *Config) { cfg.MaxConnections = 3 }},
+		{"per IP", func(cfg *Config) { cfg.MaxConnectionsPerIP = 3 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig
+			tc.cfg(&cfg)
+			addr := startServer(t, cfg)
+
+			var held []*client
+			for range 3 {
+				held = append(held, holdConnection(t, addr))
+			}
+
+			expectRejected(t, addr)
+
+			_ = held[0].conn.Close()
+			expectAccepted(t, addr)
+		})
+	}
+}
+
+// Over its rate, a client is reset and logged. Behind a proxy, the rate counts
+// the clients that the proxy tells, not the proxy.
+func TestConnectionRateLimit(t *testing.T) {
+	cfg := testConfig
+	cfg.ConnectionRateLimitPerIP = 1 // In bursts of 2.
+	tests := []struct {
+		name    string
+		options ListenerOptions
+		want    string
+	}{
+		{"direct", ListenerOptions{}, `WARN  \[127\.0\.0\.1\]:\d+ connection rejected: limit=connections\.rate_limit_per_ip`},
+		{
+			"behind a proxy", testProxyProtocol,
+			`WARN  \[192\.0\.2\.1\]:50000 connection rejected: proxy=127\.0\.0\.1 limit=connections\.rate_limit_per_ip`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			addr, stop := startServerWithOptions(t, cfg, slog.New(logging.NewTextHandler(&logs, nil)), tc.options)
+			connect := func(client string) *client {
+				c := dial(t, addr)
+				if tc.options.ProxyProtocol {
+					c.write(proxyHeader(client))
+				}
+				return c
+			}
+			status := func(client string) {
+				c := connect(client)
+				c.statusExchange(777)
+				_ = c.conn.Close()
+			}
+
+			for range 2 {
+				status("192.0.2.1:50000")
+			}
+			if tc.options.ProxyProtocol {
+				connect("192.0.2.1:50000").expectClosed()
+				status("192.0.2.2:50000")
+			} else {
+				expectRejected(t, addr)
+			}
+			stop()
+
+			if !regexp.MustCompile(`(?m)^\[\S+\] ` + tc.want + `$`).MatchString(logs.String()) {
+				t.Errorf("logs = %q, want a line matching %q", logs.String(), tc.want)
+			}
+		})
+	}
+}
+
+// After its pong, a client sends nothing: the server closes without waiting
+// for it to close, which frees its place at once.
+func TestStatusExchangeFreesConnection(t *testing.T) {
+	cfg := testConfig
+	cfg.MaxConnections = 1
+	addr := startServer(t, cfg)
+	c := dial(t, addr)
+	c.statusExchange(777)
+	c.write(modernproto.AppendPacket(nil, modernproto.PingRequestID, make([]byte, 8)))
+	c.readPacket(modernproto.PongResponseID)
+	c.expectClosed()
+	expectAccepted(t, addr)
 }
 
 // A client that sent more than its request gets the end of the connection,
