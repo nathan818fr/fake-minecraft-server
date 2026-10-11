@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -38,8 +39,10 @@ func TestLoadConfigDefaults(t *testing.T) {
 		cfg.server.MirrorProtocolVersion || cfg.server.VersionName != "" || cfg.server.Favicon != "" {
 		t.Errorf("unexpected non-default server config: %+v", cfg.server)
 	}
-	if cfg.server.ConnectionTimeout != 3*time.Second || cfg.server.HandshakeTimeout != time.Second {
-		t.Errorf("ConnectionTimeout = %v, HandshakeTimeout = %v", cfg.server.ConnectionTimeout, cfg.server.HandshakeTimeout)
+	if cfg.server.ConnectionTimeout != 3*time.Second || cfg.server.HandshakeTimeout != time.Second ||
+		cfg.server.MaxConnections != 10000 || cfg.server.MaxConnectionsPerIP != 8 || cfg.server.ConnectionRateLimitPerIP != 10 {
+		t.Errorf("ConnectionTimeout = %v, HandshakeTimeout = %v, MaxConnections = %d, MaxConnectionsPerIP = %d, ConnectionRateLimitPerIP = %d",
+			cfg.server.ConnectionTimeout, cfg.server.HandshakeTimeout, cfg.server.MaxConnections, cfg.server.MaxConnectionsPerIP, cfg.server.ConnectionRateLimitPerIP)
 	}
 	if cfg.logFormat != logging.FormatText {
 		t.Errorf("logFormat = %q, want text", cfg.logFormat)
@@ -60,11 +63,14 @@ func TestLoadConfig(t *testing.T) {
 		"PROTOCOL_NAME":    "Maintenance",
 		"PROTOCOL_VERSION": "773",
 
-		"CONNECTION_TIMEOUT": "500ms",
-		"HANDSHAKE_TIMEOUT":  "200ms",
-		"LOG_FORMAT":         "json",
-		"LOG_LEVEL":          "debug",
-		"LOG_RATE_LIMIT":     "0",
+		"CONNECTION_TIMEOUT":           "500ms",
+		"HANDSHAKE_TIMEOUT":            "200ms",
+		"MAX_CONNECTIONS":              "0",
+		"MAX_CONNECTIONS_PER_IP":       "2",
+		"CONNECTION_RATE_LIMIT_PER_IP": "3",
+		"LOG_FORMAT":                   "json",
+		"LOG_LEVEL":                    "debug",
+		"LOG_RATE_LIMIT":               "0",
 	}))
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
@@ -84,9 +90,9 @@ func TestLoadConfig(t *testing.T) {
 		t.Errorf("logFormat = %q, want json", cfg.logFormat)
 	}
 	if s.ConnectionTimeout != 500*time.Millisecond || s.HandshakeTimeout != 200*time.Millisecond ||
-		cfg.logLevel != slog.LevelDebug || s.LogRateLimit != 0 {
-		t.Errorf("ConnectionTimeout = %v, HandshakeTimeout = %v, logLevel = %v, LogRateLimit = %d",
-			s.ConnectionTimeout, s.HandshakeTimeout, cfg.logLevel, s.LogRateLimit)
+		s.MaxConnections != 0 || s.MaxConnectionsPerIP != 2 || s.ConnectionRateLimitPerIP != 3 || cfg.logLevel != slog.LevelDebug || s.LogRateLimit != 0 {
+		t.Errorf("ConnectionTimeout = %v, HandshakeTimeout = %v, MaxConnections = %d, MaxConnectionsPerIP = %d, logLevel = %v",
+			s.ConnectionTimeout, s.HandshakeTimeout, s.MaxConnections, s.MaxConnectionsPerIP, cfg.logLevel)
 	}
 }
 
@@ -179,18 +185,21 @@ func TestLoadConfigReportsAllErrors(t *testing.T) {
 		"PROTOCOL_VERSION": "1.21",
 		"FAVICON":          filepath.Join(t.TempDir(), "missing.png"),
 
-		"CONNECTION_TIMEOUT": "3",
-		"HANDSHAKE_TIMEOUT":  "-1s",
-		"LOG_FORMAT":         "xml",
-		"LOG_LEVEL":          "verbose",
-		"LOG_RATE_LIMIT":     "-1",
+		"CONNECTION_TIMEOUT":           "3",
+		"HANDSHAKE_TIMEOUT":            "-1s",
+		"MAX_CONNECTIONS":              "-1",
+		"MAX_CONNECTIONS_PER_IP":       "x",
+		"CONNECTION_RATE_LIMIT_PER_IP": "-1",
+		"LOG_FORMAT":                   "xml",
+		"LOG_LEVEL":                    "verbose",
+		"LOG_RATE_LIMIT":               "-1",
 	}))
 	if err == nil {
 		t.Fatal("loadConfig() succeeded, want an error")
 	}
 	for _, key := range []string{
 		"LISTEN_ADDR", "MAX_PLAYERS", "ONLINE_PLAYERS", "PROTOCOL_VERSION", "FAVICON",
-		"CONNECTION_TIMEOUT", "HANDSHAKE_TIMEOUT", "LOG_FORMAT", "LOG_LEVEL", "LOG_RATE_LIMIT",
+		"CONNECTION_TIMEOUT", "HANDSHAKE_TIMEOUT", "MAX_CONNECTIONS", "MAX_CONNECTIONS_PER_IP", "CONNECTION_RATE_LIMIT_PER_IP", "LOG_FORMAT", "LOG_LEVEL", "LOG_RATE_LIMIT",
 	} {
 		if !strings.Contains(err.Error(), key+":") {
 			t.Errorf("error does not mention %s: %v", key, err)
@@ -212,6 +221,14 @@ func TestLoadConfigErrorMessages(t *testing.T) {
 		{map[string]string{"PROTOCOL_VERSION": "1.21"}, `PROTOCOL_VERSION: must be an integer or "client", got "1.21"`},
 		{map[string]string{"LOG_LEVEL": "verbose"}, `LOG_LEVEL: must be debug, info, warn or error, got "verbose"`},
 		{map[string]string{"FAVICON": notPNG}, "FAVICON: " + notPNG + " is not a PNG file"},
+		{
+			map[string]string{"PROXY_PROTOCOL": "true", "PROXY_PROTOCOL_TRUSTED": "::ffff:0.0.0.0/80"},
+			`PROXY_PROTOCOL_TRUSTED: "::ffff:0.0.0.0/80" is an IPv4-mapped prefix shorter than /96`,
+		},
+		{
+			map[string]string{"PROXY_PROTOCOL": "true"},
+			"PROXY_PROTOCOL_TRUSTED: must list the proxies allowed to send headers, such as 10.0.0.0/8, or 0.0.0.0/0,::/0 for any address",
+		},
 	}
 	for _, tc := range tests {
 		if _, err := loadConfig(lookupMap(tc.vars)); err == nil || err.Error() != tc.want {
@@ -230,6 +247,55 @@ func TestLoadConfigHandshakeTimeout(t *testing.T) {
 	_, err = loadConfig(lookupMap(map[string]string{"CONNECTION_TIMEOUT": "2s", "HANDSHAKE_TIMEOUT": "5s"}))
 	if err == nil || !strings.Contains(err.Error(), "HANDSHAKE_TIMEOUT:") {
 		t.Errorf("loadConfig() error = %v, want a HANDSHAKE_TIMEOUT error", err)
+	}
+}
+
+func TestLoadConfigProxyProtocol(t *testing.T) {
+	cfg, err := loadConfig(lookupMap(map[string]string{
+		"PROXY_PROTOCOL":         "true",
+		"PROXY_PROTOCOL_TRUSTED": " 10.0.0.0/8, 192.0.2.7 ,2001:db8::/32,::ffff:198.51.100.0/120, 10.1.2.3/8",
+	}))
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if !cfg.listenerOptions.ProxyProtocol {
+		t.Error("ProxyProtocol = false, want true")
+	}
+	want := []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("192.0.2.7/32"),
+		netip.MustParsePrefix("2001:db8::/32"),
+		netip.MustParsePrefix("198.51.100.0/24"),
+		netip.MustParsePrefix("10.0.0.0/8"),
+	}
+	if !slices.Equal(cfg.listenerOptions.TrustedProxies, want) {
+		t.Errorf("TrustedProxies = %v, want %v", cfg.listenerOptions.TrustedProxies, want)
+	}
+
+	// Unix socket peers are always trusted.
+	if _, err := loadConfig(lookupMap(map[string]string{"PROXY_PROTOCOL": "true", "LISTEN_ADDR": "unix:/run/server.sock"})); err != nil {
+		t.Errorf("loadConfig() with only Unix sockets: %v", err)
+	}
+}
+
+func TestLoadConfigProxyProtocolErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		vars map[string]string
+	}{
+		{"invalid boolean", map[string]string{"PROXY_PROTOCOL": "yes"}},
+		{"invalid prefix", map[string]string{"PROXY_PROTOCOL": "true", "PROXY_PROTOCOL_TRUSTED": "10.0.0.0/33"}},
+		{"invalid address", map[string]string{"PROXY_PROTOCOL": "true", "PROXY_PROTOCOL_TRUSTED": "proxy.example.com"}},
+		{"short IPv4-mapped prefix", map[string]string{"PROXY_PROTOCOL": "true", "PROXY_PROTOCOL_TRUSTED": "::ffff:0.0.0.0/80"}},
+		{"trusted without proxy protocol", map[string]string{"PROXY_PROTOCOL_TRUSTED": "10.0.0.0/8"}},
+		{"proxy protocol without trusted proxies", map[string]string{"PROXY_PROTOCOL": "true", "LISTEN_ADDR": ":25565,unix:/run/server.sock"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := loadConfig(lookupMap(tc.vars)); err == nil {
+				t.Error("loadConfig() succeeded, want an error")
+			}
+		})
 	}
 }
 

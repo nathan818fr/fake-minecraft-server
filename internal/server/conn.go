@@ -54,8 +54,8 @@ func isUnixPeer(addr netip.AddrPort) bool {
 }
 
 // unmapAddrPort turns an IPv4-mapped IPv6 address (::ffff:192.0.2.1) into
-// IPv4. Dual-stack listeners can report IPv4 clients either way, and logs must
-// identify them the same way.
+// IPv4. Dual-stack listeners and PROXY protocol headers can report IPv4 clients
+// either way, and logs and limits must identify them the same way.
 func unmapAddrPort(addr netip.AddrPort) netip.AddrPort {
 	return netip.AddrPortFrom(addr.Addr().Unmap(), addr.Port())
 }

@@ -10,17 +10,19 @@ import (
 	"os"
 	"strings"
 	"syscall"
+
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/server"
 )
 
-// listen opens a listener on each address. If one fails, it closes the
-// others, so that the server starts on all its addresses or none.
-func listen(ctx context.Context, addrs []listenAddr) ([]net.Listener, error) {
+// listen opens a listener on each address, with options. If one fails, it
+// closes the others, so that the server starts on all its addresses or none.
+func listen(ctx context.Context, addrs []listenAddr, options server.ListenerOptions) ([]server.Listener, error) {
 	listenConfig := net.ListenConfig{
 		// Connections are short-lived and bounded by the connection timeout,
 		// so TCP keep-alive would only cost timers.
 		KeepAlive: -1,
 	}
-	listeners := make([]net.Listener, 0, len(addrs))
+	listeners := make([]server.Listener, 0, len(addrs))
 	for _, addr := range addrs {
 		var ln net.Listener
 		var err error
@@ -33,7 +35,7 @@ func listen(ctx context.Context, addrs []listenAddr) ([]net.Listener, error) {
 			closeAll(listeners)
 			return nil, err
 		}
-		listeners = append(listeners, ln)
+		listeners = append(listeners, server.Listener{Listener: ln, Options: options})
 	}
 	return listeners, nil
 }
@@ -84,7 +86,7 @@ func claimSocket(ctx context.Context, path string) (io.Closer, error) {
 	return lock, nil
 }
 
-func closeAll(listeners []net.Listener) {
+func closeAll(listeners []server.Listener) {
 	for _, ln := range listeners {
 		_ = ln.Close()
 	}

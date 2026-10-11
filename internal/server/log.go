@@ -1,10 +1,12 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/netip"
 	"sync"
 	"time"
@@ -30,19 +32,40 @@ const unixPeer = "unix"
 // limit may drop.
 type connInfo struct {
 	start time.Time
-	// remote is the address of the client, invalid for Unix socket peers.
-	remote   netip.AddrPort
-	listener listenerInfo
+	// peer is the address of the peer, invalid for Unix socket peers, and
+	// remote the address of the client: the one of the peer, or if proxied,
+	// the one that the peer, a trusted proxy, sends in a PROXY protocol
+	// header. The client is unknown until the header is read.
+	peer          netip.AddrPort
+	remote        netip.AddrPort
+	proxied       bool
+	unknownClient bool
+	listener      listenerInfo
+}
+
+// newConnInfo returns what is known about conn when listener accepts it.
+func newConnInfo(conn net.Conn, listener listenerInfo) connInfo {
+	peer := peerAddr(conn)
+	c := connInfo{start: time.Now(), peer: peer, remote: peer, listener: listener}
+	if listener.ProxyProtocol && listener.isTrustedProxy(peer) {
+		c.proxied, c.unknownClient = true, true
+	}
+	return c
 }
 
 // maxLineAttrs is the room for the attributes of a line about a connection,
 // kept on the stack so that making a line does not allocate them: the
-// longest, a login, has 11.
-const maxLineAttrs = 11
+// longest, a login behind a proxy, has 12.
+const maxLineAttrs = 12
 
 // appendAddrs appends the attributes holding the addresses of the connection.
 func (c *connInfo) appendAddrs(attrs []slog.Attr) []slog.Attr {
-	attrs = append(attrs, remoteAttr(c.remote))
+	if !c.unknownClient {
+		attrs = append(attrs, remoteAttr(c.remote))
+	}
+	if c.proxied {
+		attrs = append(attrs, proxyAttr(c.peer))
+	}
 	if c.listener.logged {
 		attrs = append(attrs, slog.String("listener", c.listener.addr))
 	}
@@ -56,6 +79,15 @@ func remoteAttr(addr netip.AddrPort) slog.Attr {
 		return slog.String(logging.RemoteKey, unixPeer)
 	}
 	return slog.Any(logging.RemoteKey, addr)
+}
+
+// proxyAttr returns the attribute logging the proxy at peer, or unixPeer for
+// Unix socket peers.
+func proxyAttr(peer netip.AddrPort) slog.Attr {
+	if isUnixPeer(peer) {
+		return slog.String("proxy", unixPeer)
+	}
+	return slog.Any("proxy", peer.Addr())
 }
 
 // logSession logs a connection that sent a valid handshake, legacy ping or
@@ -157,6 +189,21 @@ func (s *Server) logConnection(msg string, c *connInfo, line []slog.Attr, droppe
 	s.logger.LogAttrs(context.Background(), slog.LevelInfo, msg, line...)
 }
 
+// logRejected logs a connection reset for exceeding limit, the setting of that
+// limit, such as connections.max.
+func (s *Server) logRejected(limit string, c *connInfo) {
+	if !s.logger.Enabled(context.Background(), slog.LevelWarn) {
+		return
+	}
+	dropped, ok := s.logLimiter.allow(time.Now())
+	if !ok {
+		return
+	}
+	var buf [maxLineAttrs]slog.Attr
+	line := append(c.appendAddrs(buf[:0]), slog.String("limit", limit), dropped)
+	s.logger.LogAttrs(context.Background(), slog.LevelWarn, "connection rejected", line...)
+}
+
 // optionalString returns an empty attribute, which is not logged, for an empty
 // value.
 func optionalString(key, value string) slog.Attr {
@@ -190,6 +237,12 @@ func (h *headRecorder) Read(p []byte) (int, error) {
 	n, err := h.r.Read(p)
 	h.n += copy(h.buf[h.n:], p[:n])
 	return n, err
+}
+
+// restart makes the recording start at the next byte that r returns.
+func (h *headRecorder) restart(r *bufio.Reader) {
+	buffered, _ := r.Peek(r.Buffered())
+	h.n = copy(h.buf[:], buffered)
 }
 
 func (h *headRecorder) bytes() []byte {

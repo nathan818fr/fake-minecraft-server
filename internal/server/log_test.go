@@ -17,9 +17,10 @@ import (
 func TestLogging(t *testing.T) {
 	const timing = `duration=\S+`
 	tests := []struct {
-		name   string
-		client func(c *client)
-		want   string
+		name          string
+		proxyProtocol bool
+		client        func(c *client)
+		want          string
 	}{
 		{
 			name: "status and ping",
@@ -86,6 +87,12 @@ func TestLogging(t *testing.T) {
 			want:   `INFO  \S+ server list ping: protocol=777 server_address="localhost" server_port=25565 ping_request=false ` + timing + ` error="reading ping request: read tcp .*: i/o timeout"`,
 		},
 		{
+			name:          "proxied",
+			proxyProtocol: true,
+			client:        func(c *client) { c.write(proxyHeader("192.0.2.1:56324")); c.statusExchange(777) },
+			want:          `INFO  \[192\.0\.2\.1\]:56324 server list ping: proxy=127\.0\.0\.1 protocol=777 server_address="localhost" server_port=25565 ping_request=false ` + timing,
+		},
+		{
 			name:   "invalid",
 			client: func(c *client) { c.write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\n")); c.expectClosed() },
 			want:   `INFO  \S+ invalid connection: data="GET / HTTP/1\.1\\r\\nHost: localhost\\r\\n" ` + timing + ` error="reading handshake: unexpected packet: id 0x45, want 0x0"`,
@@ -97,6 +104,18 @@ func TestLogging(t *testing.T) {
 				c.expectClosed()
 			},
 			want: `INFO  \S+ invalid connection: data="\\x16\\x03\\x01a{61}" ` + timing + ` error=.*`,
+		},
+		{
+			name:          "invalid after PROXY protocol header",
+			proxyProtocol: true,
+			client:        func(c *client) { c.write(append(proxyHeader("192.0.2.1:56324"), "GET /"...)); c.expectClosed() },
+			want:          `INFO  \[192\.0\.2\.1\]:56324 invalid connection: proxy=127\.0\.0\.1 data="GET /" ` + timing + ` error=.*`,
+		},
+		{
+			name:          "invalid PROXY protocol header",
+			proxyProtocol: true,
+			client:        func(c *client) { c.handshake(777, modernproto.IntentStatus); c.expectClosed() },
+			want:          `INFO  invalid connection: proxy=127\.0\.0\.1 data=".*localhost.*" ` + timing + ` error="reading PROXY protocol header: invalid PROXY protocol header: missing signature"`,
 		},
 		{
 			name:   "legacy ping",
@@ -124,7 +143,13 @@ func TestLogging(t *testing.T) {
 			var logs bytes.Buffer
 			cfg := testConfig
 			cfg.ConnectionTimeout = 200 * time.Millisecond
-			addr, stop := startServerWithLogger(t, cfg, slog.New(logging.NewTextHandler(&logs, nil)))
+			var options ListenerOptions
+			listening := `listening: listener=127\.0\.0\.1:\d+`
+			if tc.proxyProtocol {
+				options = testProxyProtocol
+				listening += ` proxy_protocol=true`
+			}
+			addr, stop := startServerWithOptions(t, cfg, slog.New(logging.NewTextHandler(&logs, nil)), options)
 
 			c := dial(t, addr)
 			tc.client(c)
@@ -136,7 +161,7 @@ func TestLogging(t *testing.T) {
 			// stopping, as the connection can end last.
 			line := `\[\S+\] (?:` + tc.want + `)\n`
 			stopping := `\[\S+\] INFO  stopping\n`
-			want := `^\[\S+\] INFO  listening: listener=127\.0\.0\.1:\d+\n` +
+			want := `^\[\S+\] INFO  ` + listening + `\n` +
 				`(?:` + line + stopping + `|` + stopping + line + `)` +
 				`\[\S+\] INFO  stopped\n$`
 			if !regexp.MustCompile(want).MatchString(logs.String()) {
@@ -162,6 +187,47 @@ func TestLoggingLegacyPingWithoutProtocolVersion(t *testing.T) {
 	want := `INFO  \S+ legacy server list ping: legacy_ping_version=1\.4-1\.5 protocol=-1 duration=\S+`
 	if !regexp.MustCompile(`(?m)^\[\S+\] ` + want + `$`).MatchString(logs.String()) {
 		t.Errorf("logs = %q, want a line matching %q", logs.String(), want)
+	}
+}
+
+func TestLoggingRejectedConnections(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*Config, *ListenerOptions)
+		want  string
+	}{
+		{"global", func(cfg *Config, _ *ListenerOptions) { cfg.MaxConnections = 1 }, `WARN  \[127\.0\.0\.1\]:\d+ connection rejected: limit=connections\.max`},
+		// The client is not known before the header of the proxy is read.
+		{
+			"global, behind a proxy", func(cfg *Config, options *ListenerOptions) { cfg.MaxConnections = 1; *options = testProxyProtocol },
+			`WARN  connection rejected: proxy=127\.0\.0\.1 limit=connections\.max`,
+		},
+		{
+			"per IP", func(cfg *Config, _ *ListenerOptions) { cfg.MaxConnectionsPerIP = 1 },
+			`WARN  \[127\.0\.0\.1\]:\d+ connection rejected: limit=connections\.max_per_ip`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			cfg := testConfig
+			var options ListenerOptions
+			tc.setup(&cfg, &options)
+			addr, stop := startServerWithOptions(t, cfg, slog.New(logging.NewTextHandler(&logs, nil)), options)
+
+			held := dial(t, addr)
+			if options.ProxyProtocol {
+				held.write(proxyHeader("192.0.2.1:50000"))
+			}
+			held.statusExchange(777)
+			expectRejected(t, addr)
+			_ = held.conn.Close()
+			stop()
+
+			if !regexp.MustCompile(`(?m)^\[\S+\] ` + tc.want + `$`).MatchString(logs.String()) {
+				t.Errorf("logs = %q, want a line matching %q", logs.String(), tc.want)
+			}
+		})
 	}
 }
 
