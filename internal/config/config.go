@@ -24,9 +24,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nathan818fr/fake-minecraft-server/v2/internal/condition"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/logging"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/modernproto"
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/script"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/server"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/status"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/upstream"
@@ -70,6 +70,9 @@ const (
 
 type Config struct {
 	Listeners []Listener
+	// ScriptPrints are what the top level of the script printed when loaded,
+	// for the configured logger.
+	ScriptPrints []string
 	// LogFormat is empty if invalid, as Load also returns the configuration
 	// with its mistakes.
 	LogFormat logging.Format
@@ -102,6 +105,12 @@ type settings struct {
 	Upstreams map[string]upstreamSettings `yaml:"upstreams"`
 	Servers   map[string]serverSettings   `yaml:"servers"`
 	Rules     []ruleSettings              `yaml:"rules"`
+
+	// Script is the source of the script module, and ScriptFile the path of
+	// a file that holds it (see script.LoadModule). Only one of them can be
+	// set.
+	Script     string `yaml:"script"`
+	ScriptFile string `yaml:"script_file"`
 }
 
 // listenSettings are the settings of a listener: its address, written alone,
@@ -191,6 +200,9 @@ func builtinStatus() statusSettings {
 // resolvePaths makes the relative paths in s, read from a configuration file
 // in dir, relative to dir rather than to the working directory.
 func (s *settings) resolvePaths(dir string) {
+	if s.ScriptFile != "" && !filepath.IsAbs(s.ScriptFile) {
+		s.ScriptFile = filepath.Join(dir, s.ScriptFile)
+	}
 	for _, server := range s.Servers {
 		fields := server.Status
 		path, ok := fields["favicon"].(string)
@@ -236,6 +248,9 @@ func (s *settings) check() (Config, []error) {
 	cfg.Server.Upstreams = c.upstreams(s.Upstreams)
 	cfg.Server.SoftwareSignature = !s.NoSoftwareSignature
 	cfg.Server.Servers = c.servers(s.Servers, s.Upstreams, cfg.Server.SoftwareSignature)
+	if module := c.module(s.Script, s.ScriptFile); module != nil {
+		cfg.ScriptPrints = module.Prints()
+	}
 	cfg.Server.Rules = c.rules(s.Rules, cfg.Server.Servers)
 	return cfg, c.errs
 }
@@ -363,7 +378,7 @@ func (c *checker) trustedProxies(key string, entry listenSettings, network strin
 	}
 	var prefixes []netip.Prefix
 	for _, item := range entry.TrustedProxies {
-		prefix, err := parsePrefix(item)
+		prefix, err := script.ParseNetwork(item)
 		if err != nil {
 			c.fail(key, err)
 			continue
@@ -578,7 +593,7 @@ func (c *checker) rules(entries []ruleSettings, servers map[string]server.Virtua
 			rule.Name = entry.Name
 		}
 		if entry.Host != nil {
-			if hosts, err := condition.Hosts(entry.Host); err != nil {
+			if hosts, err := script.Hosts(entry.Host); err != nil {
 				c.fail(key+".host", err)
 			} else {
 				rule.Conditions = append(rule.Conditions, hosts)
@@ -594,6 +609,34 @@ func (c *checker) rules(entries []ruleSettings, servers map[string]server.Virtua
 		rules = append(rules, rule)
 	}
 	return append(rules, server.Rule{Name: defaultRuleName, Server: defaultServerID})
+}
+
+// module returns the script module, written in src or in the file at path, or
+// nil if neither is set or if it is invalid.
+func (c *checker) module(src, path string) *script.Module {
+	switch {
+	case src != "" && path != "":
+		c.failf("script_file", "cannot be set together with script")
+		return nil
+	case path != "":
+		data, err := os.ReadFile(path)
+		if err != nil {
+			c.fail("script_file", err)
+			return nil
+		}
+		m, err := script.LoadModule(string(data))
+		if err != nil {
+			c.fail("script_file", err)
+		}
+		return m
+	case src != "":
+		m, err := script.LoadModule(src)
+		if err != nil {
+			c.fail("script", err)
+		}
+		return m
+	}
+	return nil
 }
 
 // ruleName checks the name of a rule, made like IDs, but not only of digits
@@ -651,39 +694,6 @@ func parseServerAddr(s string) (host string, port uint16, err error) {
 		return "", 0, fmt.Errorf("%q has an invalid port, must be between 1 and %d", s, math.MaxUint16)
 	}
 	return host, uint16(n), nil
-}
-
-// ipv4MappedPrefixBits is the length of the prefix of IPv4-mapped IPv6
-// addresses (::ffff:0:0/96), which hold the IPv4 address in their last 32 bits.
-const ipv4MappedPrefixBits = 96
-
-// parsePrefix parses an IP address, as a prefix of its full length, or a CIDR
-// prefix.
-func parsePrefix(s string) (netip.Prefix, error) {
-	var prefix netip.Prefix
-	var err error
-	if strings.Contains(s, "/") {
-		prefix, err = netip.ParsePrefix(s)
-	} else {
-		var addr netip.Addr
-		addr, err = netip.ParseAddr(s)
-		// Client addresses with a zone never match a prefix.
-		if addr.Zone() != "" {
-			return netip.Prefix{}, fmt.Errorf("%q has an IPv6 zone, which is not supported", s)
-		}
-		prefix = netip.PrefixFrom(addr, addr.BitLen())
-	}
-	if err != nil {
-		return netip.Prefix{}, fmt.Errorf("%q is not an IP address or CIDR prefix", s)
-	}
-	// Client addresses are unmapped, so IPv4-mapped prefixes must be too.
-	if prefix.Addr().Is4In6() {
-		if prefix.Bits() < ipv4MappedPrefixBits {
-			return netip.Prefix{}, fmt.Errorf("%q is an IPv4-mapped prefix shorter than /%d", s, ipv4MappedPrefixBits)
-		}
-		prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-ipv4MappedPrefixBits)
-	}
-	return prefix.Masked(), nil
 }
 
 // textComponent returns the JSON text component of v: a component written in

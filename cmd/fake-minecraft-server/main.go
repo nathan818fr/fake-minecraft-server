@@ -70,6 +70,9 @@ func run() error {
 
 	logger := slog.Default()
 	logger.Info("starting", "version", currentVersion())
+	for _, msg := range cfg.ScriptPrints {
+		logger.LogAttrs(context.Background(), slog.LevelDebug, "script print", slog.String("hook", "load"), logging.Untrusted("text", msg))
+	}
 
 	srv, err := server.New(cfg.Server, logger)
 	if err != nil {

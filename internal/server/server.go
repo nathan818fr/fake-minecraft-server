@@ -15,11 +15,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nathan818fr/fake-minecraft-server/v2/internal/condition"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/legacyproto"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/logging"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/modernproto"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/proxyproto"
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/script"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/status"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/upstream"
 )
@@ -267,15 +267,15 @@ type session struct {
 
 	// client is what conditions know about the client, made when first
 	// needed (see conditionClient).
-	client *condition.Client
+	client *script.Client
 }
 
 // conditionClient returns what conditions know about the client of sess.
-func (sess *session) conditionClient() *condition.Client {
+func (sess *session) conditionClient() *script.Client {
 	if sess.client != nil {
 		return sess.client
 	}
-	c := &condition.Client{Host: sess.host()}
+	c := &script.Client{Host: sess.host()}
 	sess.client = c
 	return c
 }

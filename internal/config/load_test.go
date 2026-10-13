@@ -34,6 +34,8 @@ func TestVariables(t *testing.T) {
 		"FMS_SERVERS_DEFAULT",
 		"FMS_SERVERS_LOBBY",
 		"FMS_RULES",
+		"FMS_SCRIPT",
+		"FMS_SCRIPT_FILE",
 	}
 	// Variables without the prefix are ignored, such as the ones Kubernetes
 	// sets for a service named servers.

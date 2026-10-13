@@ -22,9 +22,9 @@ import (
 	"time"
 	"unicode/utf16"
 
-	"github.com/nathan818fr/fake-minecraft-server/v2/internal/condition"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/logging"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/modernproto"
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/script"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/status"
 )
 
@@ -470,7 +470,7 @@ func TestRules(t *testing.T) {
 
 // withConditionRules returns cfg with the servers "a" and "b", and a rule with
 // conditions for each one, before the rule of its server testServerID.
-func withConditionRules(cfg Config, condsA, condsB []condition.Condition) Config {
+func withConditionRules(cfg Config, condsA, condsB []script.Condition) Config {
 	cfg.Servers = maps.Clone(cfg.Servers)
 	for _, id := range []string{"a", "b"} {
 		st, err := status.Parse([]byte(`{"description":"Server ` + id + `"}`))
@@ -487,15 +487,15 @@ func withConditionRules(cfg Config, condsA, condsB []condition.Condition) Config
 // none for nil.
 func withHostRules(t *testing.T, cfg Config, hostsA, hostsB []string) Config {
 	t.Helper()
-	conds := func(patterns []string) []condition.Condition {
+	conds := func(patterns []string) []script.Condition {
 		if patterns == nil {
 			return nil
 		}
-		c, err := condition.Hosts(patterns)
+		c, err := script.Hosts(patterns)
 		if err != nil {
 			t.Fatalf("Hosts(%q) error: %v", patterns, err)
 		}
-		return []condition.Condition{c}
+		return []script.Condition{c}
 	}
 	return withConditionRules(cfg, conds(hostsA), conds(hostsB))
 }
@@ -1013,8 +1013,8 @@ func TestNewRejectsInvalidConfig(t *testing.T) {
 			*cfg = withServer(*cfg, func(server *VirtualServer) { server.Kick = nil })
 		}},
 		{"last rule with conditions", func(cfg *Config) {
-			hosts, _ := condition.Hosts([]string{"a.com"})
-			cfg.Rules = []Rule{{Conditions: []condition.Condition{hosts}, Server: testServerID}}
+			hosts, _ := script.Hosts([]string{"a.com"})
+			cfg.Rules = []Rule{{Conditions: []script.Condition{hosts}, Server: testServerID}}
 		}},
 		{"zero connection timeout", func(cfg *Config) { cfg.ConnectionTimeout = 0 }},
 		{"zero handshake timeout", func(cfg *Config) { cfg.HandshakeTimeout = 0 }},
