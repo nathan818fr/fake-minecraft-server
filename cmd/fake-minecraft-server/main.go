@@ -27,6 +27,9 @@ FMS_ variables: see https://github.com/nathan818fr/fake-minecraft-server.
 
 Commands:
   check                  Check the configuration, without starting the server
+  healthcheck [address]  Check that the server answers at address, host:port
+                         or unix:path (127.0.0.1:25565 by default), for the
+                         health checks of containers
   version                Print the version
   help                   Print this help
 `
@@ -41,6 +44,12 @@ func main() {
 		err = run()
 	case args[0] == "check" && len(args) == 1:
 		err = check()
+	case args[0] == "healthcheck" && len(args) <= 2:
+		addr := defaultHealthcheckAddr
+		if len(args) == 2 {
+			addr = args[1]
+		}
+		err = healthcheck(addr)
 	case args[0] == "version" && len(args) == 1:
 		fmt.Println(currentVersion())
 	case args[0] == "help" && len(args) == 1:

@@ -47,8 +47,8 @@ func newConnInfo(conn net.Conn, listener listenerInfo) connInfo {
 
 // maxLineAttrs is the room for the attributes of a line about a connection,
 // kept on the stack so that making a line does not allocate them: the
-// longest, a login behind a proxy, has 14.
-const maxLineAttrs = 14
+// longest, a login behind a proxy, has 15.
+const maxLineAttrs = 15
 
 // appendAddrs appends the attributes holding the addresses of the connection.
 func (c *connInfo) appendAddrs(attrs []slog.Attr) []slog.Attr {
@@ -135,9 +135,10 @@ func appendHostAttrs(attrs []slog.Attr, host, extra string, port uint16) []slog.
 }
 
 // appendRuleAttrs appends the attributes telling which rule and virtual
-// server answered sess, if any.
+// server answered sess, if any, and where its status came from, for status
+// requests.
 func appendRuleAttrs(attrs []slog.Attr, sess *session) []slog.Attr {
-	return append(attrs, optionalString("rule", sess.rule), optionalString("server", sess.server))
+	return append(attrs, optionalString("rule", sess.rule), optionalString("server", sess.server), optionalString("source", string(sess.statusSource)))
 }
 
 // eventMessage returns the log message for a handshake with the given intent,

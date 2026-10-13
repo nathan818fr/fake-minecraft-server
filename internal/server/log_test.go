@@ -14,6 +14,7 @@ import (
 
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/logging"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/modernproto"
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/status"
 )
 
 func TestLogging(t *testing.T) {
@@ -31,17 +32,17 @@ func TestLogging(t *testing.T) {
 				c.write(modernproto.AppendPacket(nil, modernproto.PingRequestID, make([]byte, 8)))
 				c.readPacket(modernproto.PongResponseID)
 			},
-			want: `INFO  \[127\.0\.0\.1\]:\d+ server list ping: protocol=777 host="localhost" port=25565 rule=0 server=test ping_request=true ` + timing,
+			want: `INFO  \[127\.0\.0\.1\]:\d+ server list ping: protocol=777 host="localhost" port=25565 rule=0 server=test source=static ping_request=true ` + timing,
 		},
 		{
 			name:   "status without ping",
 			client: func(c *client) { c.statusExchange(777); _ = c.conn.(*net.TCPConn).CloseWrite(); c.expectClosed() },
-			want:   `INFO  \S+ server list ping: protocol=777 host="localhost" port=25565 rule=0 server=test ping_request=false ` + timing,
+			want:   `INFO  \S+ server list ping: protocol=777 host="localhost" port=25565 rule=0 server=test source=static ping_request=false ` + timing,
 		},
 		{
 			name:   "status then reset",
 			client: func(c *client) { c.statusExchange(777); _ = c.conn.(*net.TCPConn).SetLinger(0) },
-			want:   `INFO  \S+ server list ping: protocol=777 host="localhost" port=25565 rule=0 server=test ping_request=false ` + timing,
+			want:   `INFO  \S+ server list ping: protocol=777 host="localhost" port=25565 rule=0 server=test source=static ping_request=false ` + timing,
 		},
 		{
 			name: "status of a Forge client",
@@ -58,7 +59,7 @@ func TestLogging(t *testing.T) {
 				_ = c.conn.(*net.TCPConn).CloseWrite()
 				c.expectClosed()
 			},
-			want: `INFO  \S+ server list ping: protocol=767 host="localhost" host_extra="FML3\\x00" port=25565 rule=0 server=test ping_request=false ` + timing,
+			want: `INFO  \S+ server list ping: protocol=767 host="localhost" host_extra="FML3\\x00" port=25565 rule=0 server=test source=static ping_request=false ` + timing,
 		},
 		{
 			name: "login",
@@ -86,13 +87,13 @@ func TestLogging(t *testing.T) {
 		{
 			name:   "timeout",
 			client: func(c *client) { c.statusExchange(777); c.expectClosed() },
-			want:   `INFO  \S+ server list ping: protocol=777 host="localhost" port=25565 rule=0 server=test ping_request=false ` + timing + ` error="reading ping request: read tcp .*: i/o timeout"`,
+			want:   `INFO  \S+ server list ping: protocol=777 host="localhost" port=25565 rule=0 server=test source=static ping_request=false ` + timing + ` error="reading ping request: read tcp .*: i/o timeout"`,
 		},
 		{
 			name:          "proxied",
 			proxyProtocol: true,
 			client:        func(c *client) { c.write(proxyHeader("192.0.2.1:56324")); c.statusExchange(777) },
-			want:          `INFO  \[192\.0\.2\.1\]:56324 server list ping: proxy=127\.0\.0\.1 protocol=777 host="localhost" port=25565 rule=0 server=test ping_request=false ` + timing,
+			want:          `INFO  \[192\.0\.2\.1\]:56324 server list ping: proxy=127\.0\.0\.1 protocol=777 host="localhost" port=25565 rule=0 server=test source=static ping_request=false ` + timing,
 		},
 		{
 			name:   "invalid",
@@ -122,7 +123,7 @@ func TestLogging(t *testing.T) {
 		{
 			name:   "legacy ping",
 			client: func(c *client) { c.write(legacyPing16); c.expectClosed() },
-			want:   `INFO  \S+ legacy server list ping: legacy_ping_version=1\.6 protocol=73 host="localhost" port=25565 rule=0 server=test ` + timing,
+			want:   `INFO  \S+ legacy server list ping: legacy_ping_version=1\.6 protocol=73 host="localhost" port=25565 rule=0 server=test source=static ` + timing,
 		},
 		{
 			name:   "legacy login",
@@ -151,7 +152,7 @@ func TestLogging(t *testing.T) {
 				options = testProxyProtocol
 				listening += ` proxy_protocol=true`
 			}
-			addr, stop := startServerWithOptions(t, cfg, slog.New(logging.NewTextHandler(&logs, nil)), options)
+			addr, stop := startServerWithOptions(t, cfg, nil, slog.New(logging.NewTextHandler(&logs, nil)), options)
 
 			c := dial(t, addr)
 			tc.client(c)
@@ -186,7 +187,7 @@ func TestLoggingLegacyPingWithoutProtocolVersion(t *testing.T) {
 	_ = c.conn.Close()
 	stop()
 
-	want := `INFO  \S+ legacy server list ping: legacy_ping_version=1\.4-1\.5 protocol=-1 rule=0 server=test duration=\S+`
+	want := `INFO  \S+ legacy server list ping: legacy_ping_version=1\.4-1\.5 protocol=-1 rule=0 server=test source=static duration=\S+`
 	if !regexp.MustCompile(`(?m)^\[\S+\] ` + want + `$`).MatchString(logs.String()) {
 		t.Errorf("logs = %q, want a line matching %q", logs.String(), want)
 	}
@@ -215,7 +216,7 @@ func TestLoggingRejectedConnections(t *testing.T) {
 			cfg := testConfig
 			var options ListenerOptions
 			tc.setup(&cfg, &options)
-			addr, stop := startServerWithOptions(t, cfg, slog.New(logging.NewTextHandler(&logs, nil)), options)
+			addr, stop := startServerWithOptions(t, cfg, nil, slog.New(logging.NewTextHandler(&logs, nil)), options)
 
 			held := dial(t, addr)
 			if options.ProxyProtocol {
@@ -271,21 +272,43 @@ func TestLogLimiter(t *testing.T) {
 	}
 }
 
-// Statuses are logged with the rule that answered, the first one that applies,
-// and its server.
-func TestLoggingRuleOfStatus(t *testing.T) {
+// Statuses are logged with their source, so that operators see when the
+// static status takes over.
+func TestLoggingStatusOfUpstream(t *testing.T) {
+	live, err := status.Parse([]byte(`{"description":"Live"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
 	var logs bytes.Buffer
-	cfg := testConfig
-	cfg.Servers = maps.Clone(cfg.Servers)
-	cfg.Servers["lobby"] = VirtualServer{Status: mustParseStatus(t, `{"description":"Lobby"}`), Kick: json.RawMessage(testKick)}
-	cfg.Rules = []Rule{{Name: "0", Server: "lobby"}, {Name: "default", Server: testServerID}}
-	addr, stop := startServerWithLogger(t, cfg, slog.New(logging.NewTextHandler(&logs, nil)))
+	cfg := withServer(testConfig, func(server *VirtualServer) { server.Upstream = "live" })
+	upstreams := map[string]Upstream{"live": fakeUpstream{live}}
+	addr, stop := startServerWithUpstreams(t, cfg, upstreams, slog.New(logging.NewTextHandler(&logs, nil)))
 	c := dial(t, addr)
 	c.statusExchange(777)
 	_ = c.conn.Close()
 	stop()
 
-	if want := " rule=0 server=lobby ping_request=false "; !strings.Contains(logs.String(), want) {
+	if want := " rule=0 server=test source=upstream ping_request=false "; !strings.Contains(logs.String(), want) {
+		t.Errorf("logs = %q, want them to contain %q", logs.String(), want)
+	}
+}
+
+// Statuses are logged with the rule that answered, the first one that applies,
+// and its server, even while its upstream is down.
+func TestLoggingRuleOfStatus(t *testing.T) {
+	var logs bytes.Buffer
+	cfg := testConfig
+	cfg.Servers = maps.Clone(cfg.Servers)
+	cfg.Servers["lobby"] = VirtualServer{Status: mustParseStatus(t, `{"description":"Lobby"}`), Upstream: "lobby", Kick: json.RawMessage(testKick)}
+	cfg.Rules = []Rule{{Name: "0", Server: "lobby"}, {Name: "default", Server: testServerID}}
+	upstreams := map[string]Upstream{"lobby": fakeUpstream{nil}}
+	addr, stop := startServerWithUpstreams(t, cfg, upstreams, slog.New(logging.NewTextHandler(&logs, nil)))
+	c := dial(t, addr)
+	c.statusExchange(777)
+	_ = c.conn.Close()
+	stop()
+
+	if want := " rule=0 server=lobby source=static ping_request=false "; !strings.Contains(logs.String(), want) {
 		t.Errorf("logs = %q, want them to contain %q", logs.String(), want)
 	}
 }

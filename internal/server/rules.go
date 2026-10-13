@@ -14,8 +14,10 @@ import (
 // VirtualServer is a server as clients see it: its status in their server
 // list, and what happens when they try to join it.
 type VirtualServer struct {
-	// Status is the status in the server list.
-	Status         *status.Status
+	// Status is the static status, answered while the upstream has none.
+	Status *status.Status
+	// Upstream is the ID of the upstream giving the live status, if any.
+	Upstream       string
 	ClientProtocol ClientProtocol
 	// Kick is the message sent to players who try to join, a JSON text
 	// component.
@@ -74,6 +76,25 @@ func (c ClientProtocol) replaces(st *status.Status) bool {
 	}
 }
 
+// statusSource is where the status answered to a client came from, as logged.
+type statusSource string
+
+const (
+	sourceStatic   statusSource = "static"
+	sourceUpstream statusSource = "upstream"
+)
+
+// status returns the status of server right now: the one of its upstream while
+// it has one, or else its static one.
+func (s *Server) status(server VirtualServer) (*status.Status, statusSource) {
+	if upstream, ok := s.upstreams[server.Upstream]; ok {
+		if st := upstream.Status(); st != nil {
+			return st, sourceUpstream
+		}
+	}
+	return server.Status, sourceStatic
+}
+
 // serverFor returns the virtual server that answers the client of sess: the
 // one of the first rule that applies, whatever the request. It records the
 // rule and the server in sess.
@@ -88,21 +109,23 @@ func (s *Server) serverFor(sess *session) VirtualServer {
 }
 
 // statusFor returns the status to answer to the client of sess, the one of its
-// server (see serverFor), with the protocol version of the client if the
-// server reports it.
+// server right now (see serverFor), with the protocol version of the client if
+// the server reports it. It records where the status came from in sess.
 func (s *Server) statusFor(sess *session) *status.Status {
 	server := s.serverFor(sess)
-	st := server.Status
+	st, source := s.status(server)
+	sess.statusSource = source
 	if protocolVersion, ok := clientProtocolVersion(sess); ok && server.ClientProtocol.replaces(st) {
 		st = st.WithProtocolVersion(protocolVersion)
 	}
 	return st
 }
 
-// checkServers checks the virtual servers, which must all have a status and a
-// kick message, and the rules, which must all target one. The last rule must
-// have no conditions, so that every client gets an answer.
-func checkServers(cfg *Config) error {
+// checkServers checks the virtual servers, which must all have a static status
+// and a kick message, and whose upstreams must be in upstreams, and the rules,
+// which must all target one. The last rule must have no conditions, so that
+// every client gets an answer.
+func checkServers(cfg *Config, upstreams map[string]Upstream) error {
 	if len(cfg.Rules) == 0 {
 		return errors.New("no rules")
 	}
@@ -116,6 +139,9 @@ func checkServers(cfg *Config) error {
 	}
 	for _, id := range slices.Sorted(maps.Keys(cfg.Servers)) {
 		server := cfg.Servers[id]
+		if _, ok := upstreams[server.Upstream]; !ok && server.Upstream != "" {
+			return fmt.Errorf("server %s: no upstream %q", id, server.Upstream)
+		}
 		if server.Status == nil {
 			return fmt.Errorf("server %s: no status", id)
 		}

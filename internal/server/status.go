@@ -32,9 +32,10 @@ func clientProtocolVersion(sess *session) (int32, bool) {
 	}
 }
 
-// CheckStatusLength checks that st, the status of a server with clientProtocol,
-// fits in a status response, even with the longest protocol version if it may
-// be the one of each client, and with the signature if signed.
+// CheckStatusLength checks that st, the static status of a server with
+// clientProtocol, fits in a status response, even with the longest protocol
+// version if it may be the one of each client, and with the signature if
+// signed.
 func CheckStatusLength(st *status.Status, clientProtocol ClientProtocol, signed bool) error {
 	if clientProtocol.replaces(st) {
 		st = st.WithProtocolVersion(math.MinInt32)
