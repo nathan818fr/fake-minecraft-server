@@ -78,8 +78,8 @@ type variable struct {
 // variables returns the variables of env that override the settings in s.
 // Their names are envPrefix then the keys of the settings in uppercase, with
 // underscores for dots: FMS_CONNECTIONS_MAX_PER_IP for connections.max_per_ip.
-// Each server has one, named after its ID, which is merged into it:
-// FMS_SERVERS_LOBBY for servers.lobby.
+// Each server and upstream has one, named after its ID, which is merged into
+// it: FMS_SERVERS_LOBBY for servers.lobby.
 func variables(s *settings, env map[string]string) []variable {
 	var vars []variable
 	var walk func(v reflect.Value, prefix string)
@@ -208,11 +208,13 @@ func hasField(t reflect.Type, key string) bool {
 }
 
 // mergeEntry merges text, written in YAML (such as a flow mapping, or JSON),
-// into the entry with ID id of the servers held by field.
+// into the entry with ID id of the servers or upstreams held by field.
 func mergeEntry(field reflect.Value, id, text string) []error {
 	switch entries := field.Addr().Interface().(type) {
 	case *map[string]serverSettings:
 		return mergeServer(entries, id, text)
+	case *map[string]upstreamSettings:
+		return mergeUpstream(entries, id, text)
 	default:
 		panic(fmt.Sprintf("unsupported entries type %T", entries))
 	}
@@ -237,6 +239,20 @@ func mergeServer(servers *map[string]serverSettings, id, text string) []error {
 		*servers = make(map[string]serverSettings)
 	}
 	(*servers)[id] = merged
+	return nil
+}
+
+// mergeUpstream merges text into the upstream with ID id of upstreams, which
+// keeps the options that text does not set.
+func mergeUpstream(upstreams *map[string]upstreamSettings, id, text string) []error {
+	merged := (*upstreams)[id]
+	if errs := decodeYAML([]byte(text), &merged); errs != nil {
+		return singleLine(errs, text)
+	}
+	if *upstreams == nil {
+		*upstreams = make(map[string]upstreamSettings)
+	}
+	(*upstreams)[id] = merged
 	return nil
 }
 

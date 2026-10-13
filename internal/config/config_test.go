@@ -16,6 +16,7 @@ import (
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/condition"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/logging"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/server"
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/upstream"
 )
 
 func loadEnv(vars map[string]string) (Config, error) {
@@ -71,8 +72,8 @@ func TestDefaults(t *testing.T) {
 	if vs := cfg.Server.Servers["default"]; string(vs.Kick) != `{"text":"§cNot available"}` || vs.ClientProtocol != server.ClientProtocolAuto {
 		t.Errorf("default server = %+v, want the built-in kick message and the client protocol by default", vs)
 	}
-	if want := []server.Rule{{Name: "default", Server: "default"}}; !reflect.DeepEqual(cfg.Server.Rules, want) {
-		t.Errorf("rules = %v, want %v", cfg.Server.Rules, want)
+	if want := []server.Rule{{Name: "default", Server: "default"}}; len(cfg.Server.Upstreams) != 0 || !reflect.DeepEqual(cfg.Server.Rules, want) {
+		t.Errorf("upstreams = %v, rules = %v, want none and %v", cfg.Server.Upstreams, cfg.Server.Rules, want)
 	}
 	if cfg.Server.ConnectionTimeout != 3*time.Second || cfg.Server.HandshakeTimeout != time.Second ||
 		cfg.Server.MaxConnections != 10000 || cfg.Server.MaxConnectionsPerIP != 8 || cfg.Server.ConnectionRateLimitPerIP != 10 {
@@ -128,8 +129,17 @@ servers:
       forgeData: { fmlNetworkVersion: 3 }
     client_protocol: never
     kick: { text: Maintenance, color: red }
+
+upstreams:
+  lobby:
+    address: lobby.example.com
   creative:
-    status: { description: Creative }
+    address: "[2001:db8::1]:25566"
+    handshake: { host: creative.example.com, port: 25565, protocol: 773 }
+    interval: 1m
+    retry_interval: 5s
+    timeout: 3s
+    max_age: 5m
 
 rules:
   - name: creative
@@ -189,6 +199,33 @@ rules:
 	if got, want := statusJSON(t, cfg, "maintenance"), `{"description":"§cMaintenance","forgeData":{"fmlNetworkVersion":3}}`; got != want {
 		t.Errorf("maintenance status = %s, want %s", got, want)
 	}
+
+	wantUpstreams := map[string]upstream.Config{
+		"lobby": {
+			Host:            "lobby.example.com",
+			ServerAddress:   "lobby.example.com",
+			ServerPort:      25565,
+			ProtocolVersion: -1,
+			Interval:        10 * time.Second,
+			RetryInterval:   10 * time.Second,
+			Timeout:         5 * time.Second,
+			MaxAge:          30 * time.Second,
+		},
+		"creative": {
+			Host:            "2001:db8::1",
+			Port:            25566,
+			ServerAddress:   "creative.example.com",
+			ServerPort:      25565,
+			ProtocolVersion: 773,
+			Interval:        time.Minute,
+			RetryInterval:   5 * time.Second,
+			Timeout:         3 * time.Second,
+			MaxAge:          5 * time.Minute,
+		},
+	}
+	if !maps.Equal(cfg.Server.Upstreams, wantUpstreams) {
+		t.Errorf("upstreams = %+v, want %+v", cfg.Server.Upstreams, wantUpstreams)
+	}
 }
 
 // Log formats and levels are lowercase names, in variables too.
@@ -213,6 +250,82 @@ func TestHandshakeTimeout(t *testing.T) {
 	cfg, err = loadEnv(map[string]string{"FMS_CONNECTIONS_TIMEOUT": "2s", "FMS_CONNECTIONS_HANDSHAKE_TIMEOUT": "2s"})
 	if err != nil || cfg.Server.HandshakeTimeout != 2*time.Second {
 		t.Errorf("HandshakeTimeout = %v, %v, want 2s", cfg.Server.HandshakeTimeout, err)
+	}
+}
+
+// A server uses the upstream with its own ID unless it sets another one, or
+// none, and keeps its static status, answered while the upstream does not
+// answer. An upstream without a server makes one.
+func TestServerUpstreams(t *testing.T) {
+	cfg, err := loadFile(t, `
+upstreams:
+  lobby: { address: lobby.example.com }
+  hub: { address: hub.example.com }
+  solo: { address: solo.example.com }
+servers:
+  default: { status: { description: Fallback } }
+  lobby: { kick: Lobby }
+  play_b: { upstream: lobby }
+  hub: { upstream: "", status: { description: Hub } }
+rules: [{ host: [play.example.com], server: play_b }, { server: solo }]
+`, map[string]string{"FMS_UPSTREAMS_DEFAULT": "{ address: mc.example.com }"})
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	for id, want := range map[string]string{"default": "default", "lobby": "lobby", "play_b": "lobby", "hub": "", "solo": "solo"} {
+		if got := cfg.Server.Servers[id].Upstream; got != want {
+			t.Errorf("server %s: upstream = %q, want %q", id, got, want)
+		}
+	}
+	if got := statusJSON(t, cfg, "default"); got != `{"description":"Fallback"}` {
+		t.Errorf("default status = %s, want the one of the file", got)
+	}
+	if got := slices.Sorted(maps.Keys(cfg.Server.Upstreams)); !slices.Equal(got, []string{"default", "hub", "lobby", "solo"}) {
+		t.Errorf("upstreams = %v, want each one once", got)
+	}
+}
+
+// The default retry interval, timeout and max age follow the interval and the
+// timeout.
+func TestUpstreamDefaults(t *testing.T) {
+	tests := []struct {
+		entry                          string
+		retryInterval, timeout, maxAge time.Duration
+	}{
+		{"{ address: lobby.example.com, interval: 1s }", time.Second, time.Second, 3 * time.Second},
+		{"{ address: lobby.example.com, interval: 1s, timeout: 5s }", time.Second, 5 * time.Second, 6 * time.Second},
+	}
+	for _, tc := range tests {
+		cfg, err := loadEnv(map[string]string{"FMS_UPSTREAMS_LOBBY": tc.entry})
+		got := cfg.Server.Upstreams["lobby"]
+		if err != nil || got.RetryInterval != tc.retryInterval || got.Timeout != tc.timeout || got.MaxAge != tc.maxAge {
+			t.Errorf("FMS_UPSTREAMS_LOBBY=%q: RetryInterval = %v, Timeout = %v, MaxAge = %v, %v, want %v, %v and %v",
+				tc.entry, got.RetryInterval, got.Timeout, got.MaxAge, err, tc.retryInterval, tc.timeout, tc.maxAge)
+		}
+	}
+}
+
+// Addresses without a port keep none, so that their SRV record is looked up,
+// while the handshake has the default port, as clients send it.
+func TestUpstreamAddresses(t *testing.T) {
+	tests := []struct {
+		address    string
+		host       string
+		port       uint16
+		serverPort uint16
+	}{
+		{"lobby.example.com", "lobby.example.com", 0, 25565},
+		{"lobby.example.com:25566", "lobby.example.com", 25566, 25566},
+		{"[2001:db8::1]", "2001:db8::1", 0, 25565},
+		{"[2001:db8::1]:25566", "2001:db8::1", 25566, 25566},
+	}
+	for _, tc := range tests {
+		cfg, err := loadEnv(map[string]string{"FMS_UPSTREAMS_LOBBY": `{ address: "` + tc.address + `" }`})
+		got := cfg.Server.Upstreams["lobby"]
+		if err != nil || got.Host != tc.host || got.Port != tc.port || got.ServerAddress != tc.host || got.ServerPort != tc.serverPort {
+			t.Errorf("address %q: Host = %q, Port = %d, ServerAddress = %q, ServerPort = %d, %v, want %q, %d, %q and %d",
+				tc.address, got.Host, got.Port, got.ServerAddress, got.ServerPort, err, tc.host, tc.port, tc.host, tc.serverPort)
+		}
 	}
 }
 
@@ -312,24 +425,29 @@ func TestJSONDescription(t *testing.T) {
 }
 
 // Every server without a status or a kick message, the default one or not,
-// even empty, gets the built-in ones, never those of another server.
+// even empty, or made from an upstream, gets the built-in ones, never those of
+// another server. The status of an upstream replaces the built-in one while
+// it answers.
 func TestBuiltinDefaults(t *testing.T) {
 	cfg, err := loadFile(t, `
+upstreams:
+  survival: { address: survival.example.com }
+  creative: { address: creative.example.com }
 servers:
   default: { status: { description: Hello }, kick: Bye }
   lobby: { client_protocol: never }
-  creative: { kick: Closed }
+  creative: { upstream: "" }
 `, nil)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
-	for _, id := range []string{"lobby", "creative"} {
+	for _, id := range []string{"lobby", "creative", "survival"} {
 		if got := statusJSON(t, cfg, id); got != defaultStatus {
 			t.Errorf("server %s: status = %s, want %s", id, got, defaultStatus)
 		}
-	}
-	if got := string(cfg.Server.Servers["lobby"].Kick); got != `{"text":"§cNot available"}` {
-		t.Errorf("lobby kick message = %s, want the built-in one", got)
+		if got := string(cfg.Server.Servers[id].Kick); got != `{"text":"§cNot available"}` {
+			t.Errorf("server %s: kick message = %s, want the built-in one", id, got)
+		}
 	}
 	cfg, err = loadEnv(nil)
 	if got := statusJSON(t, cfg, "default"); err != nil || got != defaultStatus {
@@ -446,6 +564,31 @@ func TestCheckErrors(t *testing.T) {
 		{"wildcard without domain", "rules: [{ host: [\"*..a.com\"], server: default }]\n", `rules.0.host: invalid host "*..a.com": "*." must be followed by a domain`},
 		{"empty label in a host", "rules: [{ host: [a..com], server: default }]\n", `rules.0.host: invalid host "a..com": empty label`},
 		{"leading dot without domain", "rules: [{ host: [..a.com], server: default }]\n", `rules.0.host: invalid host "..a.com": "." must be followed by a domain`},
+
+		{"server with an unknown upstream", "servers:\n  lobby: { upstream: other, kick: Bye }\n", `servers.lobby.upstream: no upstream has the ID "other"`},
+
+		{"upstream with an invalid ID", "upstreams:\n  My-Lobby: { address: lobby.example.com }\n", `upstreams.My-Lobby: the ID must be made of lowercase letters, digits and underscores, got "My-Lobby"`},
+		{"upstream without address", "upstreams:\n  lobby: { interval: 1s }\n", "upstreams.lobby.address: must be set"},
+		{
+			"upstream with invalid handshake port", "upstreams:\n  lobby: { address: lobby.example.com, handshake: { port: 65536 } }\n",
+			"upstreams.lobby.handshake.port: must be between 1 and 65535, got 65536",
+		},
+		{
+			"upstream with unbracketed IPv6 address", "upstreams:\n  lobby: { address: \"2001:db8::1\" }\n",
+			`upstreams.lobby.address: "2001:db8::1" must be host or host:port`,
+		},
+		{
+			"upstream with invalid port", "upstreams:\n  lobby: { address: lobby.example.com:0 }\n",
+			`upstreams.lobby.address: "lobby.example.com:0" has an invalid port, must be between 1 and 65535`,
+		},
+		{
+			"upstream with negative duration", "upstreams:\n  lobby: { address: lobby.example.com, interval: -1s }\n",
+			"upstreams.lobby.interval: must be positive, got -1s",
+		},
+		{
+			"upstream with short max_age", "upstreams:\n  lobby: { address: lobby.example.com, max_age: 12s }\n",
+			"upstreams.lobby.max_age: must be at least interval + timeout (15s), the longest time between two successful polls, got 12s",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -464,11 +607,15 @@ connections:
   max: -1
 log:
   level: verbose
+upstreams:
+  lobby: { interval: 0s }
 `, nil)
 	want := []string{
 		"connections.timeout: must be positive, got -1s",
 		"connections.max: must be between 0 and 2147483647, got -1",
 		`log.level: must be debug, info, warn or error, got "verbose"`,
+		"upstreams.lobby.address: must be set",
+		"upstreams.lobby.interval: must be positive, got 0s",
 	}
 	if err == nil || err.Error() != strings.Join(want, "\n") {
 		t.Errorf("Load() error = %v, want %s", err, strings.Join(want, "\n"))

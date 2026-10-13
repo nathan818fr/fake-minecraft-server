@@ -1,6 +1,6 @@
 // Package modernproto implements the small subset of the Minecraft Java Edition
 // protocol of clients since 1.7 needed to answer server list pings and refuse
-// logins.
+// logins, and to ask other servers for their status.
 package modernproto
 
 import (

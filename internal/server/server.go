@@ -20,6 +20,8 @@ import (
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/logging"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/modernproto"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/proxyproto"
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/status"
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/upstream"
 )
 
 // acceptRetryDelay paces retries after accept errors, such as running out of
@@ -34,6 +36,9 @@ const legacyPingWait = 500 * time.Millisecond
 type Config struct {
 	// Servers holds the virtual servers that the rules choose from, by ID.
 	Servers map[string]VirtualServer
+	// Upstreams holds the upstreams of the virtual servers, by ID, polled while
+	// the server serves.
+	Upstreams map[string]upstream.Config
 	// Rules tell which virtual server answers each client: the one of the
 	// first rule that applies. The last one must always apply, without
 	// conditions.
@@ -89,9 +94,20 @@ type ListenerOptions struct {
 	TrustedProxies []netip.Prefix
 }
 
+// Upstream is a server whose status changes, such as an upstream.Poller.
+type Upstream interface {
+	// Run keeps the status up to date until ctx is canceled.
+	Run(ctx context.Context)
+	// Status returns the current status of the server, or nil if it has
+	// none. It is valid (see status.Status.Check), but checked against the
+	// length limit only when answered, as it changes.
+	Status() *status.Status
+}
+
 type Server struct {
-	cfg    Config
-	logger *slog.Logger
+	cfg       Config
+	logger    *slog.Logger
+	upstreams map[string]Upstream
 
 	connLimiter   semaphore
 	clientLimiter *clientLimiter
@@ -100,16 +116,26 @@ type Server struct {
 }
 
 func New(cfg Config, logger *slog.Logger) (*Server, error) {
+	upstreams := make(map[string]Upstream, len(cfg.Upstreams))
+	for id, upstreamCfg := range cfg.Upstreams {
+		upstreams[id] = upstream.NewPoller(id, upstreamCfg, logger)
+	}
+	return newServer(cfg, upstreams, logger)
+}
+
+// newServer is New with the upstreams already made, such as fakes in tests.
+func newServer(cfg Config, upstreams map[string]Upstream, logger *slog.Logger) (*Server, error) {
 	if cfg.ConnectionTimeout <= 0 || cfg.HandshakeTimeout <= 0 {
 		return nil, errors.New("connection and handshake timeouts must be positive")
 	}
-	if err := checkServers(&cfg); err != nil {
+	if err := checkServers(&cfg, upstreams); err != nil {
 		return nil, err
 	}
 
 	return &Server{
-		cfg:    cfg,
-		logger: logger,
+		cfg:       cfg,
+		logger:    logger,
+		upstreams: upstreams,
 
 		connLimiter:   newSemaphore(cfg.MaxConnections),
 		clientLimiter: newClientLimiter(cfg.MaxConnectionsPerIP),
@@ -120,13 +146,19 @@ func New(cfg Config, logger *slog.Logger) (*Server, error) {
 
 // Serve accepts connections on the listeners until ctx is canceled or one of
 // them fails, then closes them all and waits for the remaining connections to
-// finish. The limits apply to all the listeners together.
+// finish. The limits apply to all the listeners together. The upstreams are
+// polled meanwhile.
 func (s *Server) Serve(ctx context.Context, listeners ...Listener) error {
 	if len(listeners) == 0 {
 		return errors.New("no listener to serve")
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	var polling sync.WaitGroup
+	for _, u := range s.upstreams {
+		polling.Go(func() { u.Run(ctx) })
+	}
 
 	var conns sync.WaitGroup
 
@@ -151,6 +183,8 @@ func (s *Server) Serve(ctx context.Context, listeners ...Listener) error {
 		s.logger.Info("stopping")
 	}
 	conns.Wait()
+	cancel() // Stops polling the upstreams.
+	polling.Wait()
 	if err == nil {
 		s.logger.Info("stopped")
 	}
@@ -217,10 +251,12 @@ type session struct {
 	conn connInfo
 
 	handshake modernproto.Handshake
-	// rule is the name of the rule that answered, if any, and server the ID of
-	// its virtual server.
-	rule   string
-	server string
+	// rule is the name of the rule that answered, if any, server the ID of its
+	// virtual server, and statusSource where its status came from, for status
+	// requests.
+	rule         string
+	server       string
+	statusSource statusSource
 	// sentPingRequest reports whether the client sent a ping request after the
 	// status request, to measure its latency.
 	sentPingRequest bool
