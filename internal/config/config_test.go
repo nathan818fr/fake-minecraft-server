@@ -534,6 +534,8 @@ func TestCheckErrors(t *testing.T) {
 		{"host with a space", "rules: [{ host: [\"a .com\"], server: default }]\n", `rules.0.host: invalid host "a .com": must not contain spaces or control characters`},
 		{"wildcard inside a host", "rules: [{ host: [\"a.*.com\"], server: default }]\n", `rules.0.host: invalid host "a.*.com": a wildcard is only allowed as "*." followed by a domain`},
 		{"wildcard alone", "rules: [{ host: [\"*\"], server: default }]\n", `rules.0.host: invalid host "*": a wildcard is only allowed as "*." followed by a domain`},
+		{"invalid condition", "rules: [{ when: 'protcol < 47', server: default }]\n", "rules.0.when: 1:1: undefined: protcol (did you mean protocol?)"},
+		{"condition failing with a sample", "rules: [{ when: host, server: default }]\n", `rules.0.when: fails for a modern ping (host "mc.example.com"): must return True or False, got string`},
 		{"wildcard without domain", "rules: [{ host: [\"*..a.com\"], server: default }]\n", `rules.0.host: invalid host "*..a.com": "*." must be followed by a domain`},
 		{"empty label in a host", "rules: [{ host: [a..com], server: default }]\n", `rules.0.host: invalid host "a..com": empty label`},
 		{"leading dot without domain", "rules: [{ host: [..a.com], server: default }]\n", `rules.0.host: invalid host "..a.com": "." must be followed by a domain`},
@@ -619,4 +621,39 @@ func hostConditions(t *testing.T, patterns ...string) []condition.Condition {
 		t.Fatalf("Hosts(%q) error: %v", patterns, err)
 	}
 	return []condition.Condition{hosts}
+}
+
+// Conditions are Starlark expressions, which may span several lines.
+func TestRuleConditions(t *testing.T) {
+	cfg, err := loadFile(t, `
+rules:
+  - when: |
+      in_network(ip, "10.0.0.0/8")
+        and protocol >= 767
+    server: default
+`, nil)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	rules := cfg.Server.Rules
+	if len(rules) != 2 || len(rules[0].Conditions) != 1 || len(rules[1].Conditions) != 0 {
+		t.Fatalf("rules = %+v, want a condition, then the implicit last rule", rules)
+	}
+	for client, want := range map[*condition.Client]bool{
+		{IP: "10.1.2.3", Protocol: 767}:  true,
+		{IP: "192.0.2.1", Protocol: 767}: false,
+		{IP: "10.1.2.3", Protocol: 47}:   false,
+	} {
+		if got, err := rules[0].Conditions[0].Match(client); err != nil || got != want {
+			t.Errorf("condition with %+v = %v, %v, want %v", client, got, err, want)
+		}
+	}
+
+	cfg, err = loadEnv(map[string]string{"RULES": `[{ when: 'event == "join"', server: default }]`})
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if got, err := cfg.Server.Rules[0].Conditions[0].Match(&condition.Client{Event: condition.EventJoin}); err != nil || !got {
+		t.Errorf("condition of RULES = %v, %v, want a match", got, err)
+	}
 }

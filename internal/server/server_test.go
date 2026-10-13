@@ -507,6 +507,80 @@ func TestRuleHostsOfLegacyClients(t *testing.T) {
 	}
 }
 
+// withWhenRules is like withConditionRules, with conditions written in
+// Starlark.
+func withWhenRules(t *testing.T, cfg Config, whenA, whenB string) Config {
+	t.Helper()
+	compile := func(src string) []condition.Condition {
+		c, err := condition.Compile(src)
+		if err != nil {
+			t.Fatalf("Compile(%q) error: %v", src, err)
+		}
+		return []condition.Condition{c}
+	}
+	return withConditionRules(cfg, compile(whenA), compile(whenB))
+}
+
+// serverOf returns the server of withConditionRules whose status description
+// or kick message is text, a JSON string or legacy text.
+func serverOf(text string) string {
+	text = strings.Trim(text, `"`)
+	for _, prefix := range []string{"Server ", "Kick "} {
+		if id, ok := strings.CutPrefix(text, prefix); ok {
+			return id
+		}
+	}
+	return text
+}
+
+// Conditions see what clients sent and how they connected.
+func TestRuleConditions(t *testing.T) {
+	tests := []struct {
+		name         string
+		whenA, whenB string
+		client       func(c *client) string // Returns the server that answered.
+		want         string
+	}{
+		{"join", `event == "join" and not transferred`, `transferred`, func(c *client) string {
+			c.handshake(777, modernproto.IntentLogin)
+			return serverOf(c.readString(modernproto.LoginDisconnectID))
+		}, "a"},
+		{"transfer", `event == "join" and not transferred`, `transferred`, func(c *client) string {
+			c.handshake(777, modernproto.IntentTransfer)
+			return serverOf(c.readString(modernproto.LoginDisconnectID))
+		}, "b"},
+		{"ping", `event == "join"`, `event == "ping" and protocol == 777 and port == 25565 and host == "localhost"`, func(c *client) string {
+			return serverOf(string(c.statusExchange(777)["description"]))
+		}, "b"},
+		{"legacy ping", `legacy and legacy_ping_version == "1.4-1.5"`, `legacy`, func(c *client) string {
+			c.write(legacyPing16)
+			return serverOf(strings.Split(c.readLegacyResponse(), "\x00")[3])
+		}, "b"},
+		{"address", `ip == "127.0.0.1" and listener.startswith("127.0.0.1:")`, `True`, func(c *client) string {
+			return serverOf(string(c.statusExchange(777)["description"]))
+		}, "a"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := dial(t, startServer(t, withWhenRules(t, testConfig, tc.whenA, tc.whenB)))
+			if got := tc.client(c); got != tc.want {
+				t.Errorf("server = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Conditions see the address of clients behind a proxy, from its PROXY
+// protocol header.
+func TestRuleConditionOfProxiedClient(t *testing.T) {
+	cfg := withWhenRules(t, testConfig, `in_network(ip, "192.0.2.0/24")`, `True`)
+	c := dial(t, startProxiedServer(t, cfg))
+	c.write(proxyHeader("192.0.2.1:56324"))
+	if got := string(c.statusExchange(777)["description"]); got != `"Server a"` {
+		t.Errorf("description = %s, want the one of server a", got)
+	}
+}
+
 // By default, statuses report the protocol version of each client, unless
 // they have one that no client has, which clients show as incompatible with
 // the version name.

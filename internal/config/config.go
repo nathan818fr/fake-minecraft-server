@@ -157,9 +157,11 @@ type handshakeSettings struct {
 }
 
 type ruleSettings struct {
-	Name   string   `yaml:"name"`
-	Host   []string `yaml:"host"`
-	Server string   `yaml:"server"`
+	Name string   `yaml:"name"`
+	Host []string `yaml:"host"`
+	// When is a Starlark expression (see condition.Compile).
+	When   string `yaml:"when"`
+	Server string `yaml:"server"`
 }
 
 // addDefaultServer adds the default server to s, with the built-in status
@@ -342,7 +344,7 @@ func (c *checker) trustedProxies(key string, entry listenSettings, network strin
 	}
 	var prefixes []netip.Prefix
 	for _, item := range entry.TrustedProxies {
-		prefix, err := parsePrefix(item)
+		prefix, err := condition.ParseNetwork(item)
 		if err != nil {
 			c.fail(key, err)
 			continue
@@ -565,6 +567,13 @@ func (c *checker) rules(entries []ruleSettings, servers map[string]server.Virtua
 				rule.Conditions = append(rule.Conditions, hosts)
 			}
 		}
+		if entry.When != "" {
+			if when, err := condition.Compile(entry.When); err != nil {
+				c.fail(key+".when", err)
+			} else {
+				rule.Conditions = append(rule.Conditions, when)
+			}
+		}
 		if _, ok := servers[entry.Server]; !ok {
 			if entry.Server == "" {
 				c.failf(key+".server", "must be set")
@@ -632,39 +641,6 @@ func parseServerAddr(s string) (host string, port uint16, err error) {
 		return "", 0, fmt.Errorf("%q has an invalid port, must be between 1 and %d", s, math.MaxUint16)
 	}
 	return host, uint16(n), nil
-}
-
-// ipv4MappedPrefixBits is the length of the prefix of IPv4-mapped IPv6
-// addresses (::ffff:0:0/96), which hold the IPv4 address in their last 32 bits.
-const ipv4MappedPrefixBits = 96
-
-// parsePrefix parses an IP address, as a prefix of its full length, or a CIDR
-// prefix.
-func parsePrefix(s string) (netip.Prefix, error) {
-	var prefix netip.Prefix
-	var err error
-	if strings.Contains(s, "/") {
-		prefix, err = netip.ParsePrefix(s)
-	} else {
-		var addr netip.Addr
-		addr, err = netip.ParseAddr(s)
-		// Client addresses with a zone never match a prefix.
-		if addr.Zone() != "" {
-			return netip.Prefix{}, fmt.Errorf("%q has an IPv6 zone, which is not supported", s)
-		}
-		prefix = netip.PrefixFrom(addr, addr.BitLen())
-	}
-	if err != nil {
-		return netip.Prefix{}, fmt.Errorf("%q is not an IP address or CIDR prefix", s)
-	}
-	// Client addresses are unmapped, so IPv4-mapped prefixes must be too.
-	if prefix.Addr().Is4In6() {
-		if prefix.Bits() < ipv4MappedPrefixBits {
-			return netip.Prefix{}, fmt.Errorf("%q is an IPv4-mapped prefix shorter than /%d", s, ipv4MappedPrefixBits)
-		}
-		prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-ipv4MappedPrefixBits)
-	}
-	return prefix.Masked(), nil
 }
 
 // textComponent returns the JSON text component of v: a component written in

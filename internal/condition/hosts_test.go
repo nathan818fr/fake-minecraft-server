@@ -39,8 +39,8 @@ func TestHosts(t *testing.T) {
 		"play.a.com.example": false,
 		"":                   false,
 	} {
-		if got := c.Match(&Client{Host: host}); got != want {
-			t.Errorf("Match(%q) = %v, want %v", host, got, want)
+		if got, err := c.Match(&Client{Host: host}); err != nil || got != want {
+			t.Errorf("Match(%q) = %v, %v, want %v", host, got, err, want)
 		}
 	}
 }

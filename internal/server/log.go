@@ -8,9 +8,11 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/nathan818fr/fake-minecraft-server/internal/condition"
 	"github.com/nathan818fr/fake-minecraft-server/internal/logging"
 	"github.com/nathan818fr/fake-minecraft-server/internal/modernproto"
 )
@@ -20,8 +22,8 @@ import (
 const unixPeer = "unix"
 
 // connInfo holds the start time and addresses of a connection, for its log
-// lines. Its log attributes are only made for the lines logged, which the rate
-// limit may drop.
+// lines and the conditions of rules. Its log attributes are only made for the
+// lines logged, which the rate limit may drop.
 type connInfo struct {
 	start time.Time
 	// peer is the address of the peer, invalid for Unix socket peers, and
@@ -83,6 +85,9 @@ func proxyAttr(peer netip.AddrPort) slog.Attr {
 // legacy login.
 func (s *Server) logSession(sess *session, err error) {
 	c := &sess.conn
+	for _, ruleErr := range sess.ruleErrors {
+		s.logRuleError(c, ruleErr)
+	}
 	dropped, ok := s.allowConnection()
 	if !ok {
 		return
@@ -134,12 +139,18 @@ func hostAttrs(host, extra string, port uint16) []slog.Attr {
 }
 
 // ruleAttrs returns the attributes telling which rule and virtual server
-// answered sess, if any, and where its status came from, for status requests.
+// answered sess, if any, where its status came from, for status requests, and
+// which rules failed, whose rule failed lines may be suppressed.
 func ruleAttrs(sess *session) []slog.Attr {
+	failed := make([]string, len(sess.ruleErrors))
+	for i, ruleErr := range sess.ruleErrors {
+		failed[i] = ruleErr.rule
+	}
 	return []slog.Attr{
 		optionalString("rule", sess.rule),
 		optionalString("server", sess.server),
 		optionalString("source", string(sess.statusSource)),
+		optionalString("failed_rules", strings.Join(failed, ",")), // Rule names have no commas.
 	}
 }
 
@@ -189,6 +200,56 @@ func (s *Server) logConnection(msg string, c *connInfo, attrs []slog.Attr, dropp
 		line = append(line, logging.Error(err))
 	}
 	s.logger.LogAttrs(context.Background(), slog.LevelInfo, msg, line...)
+}
+
+// logRuleError logs a rule whose condition failed, which did not apply, with
+// the values of the variables that it failed with, in a group so that their
+// names never clash with the other attributes. Its lines are limited for each
+// rule (see ruleErrorLimiter).
+func (s *Server) logRuleError(c *connInfo, ruleErr ruleError) {
+	if !s.logger.Enabled(context.Background(), slog.LevelWarn) {
+		return
+	}
+	now := time.Now()
+	suppressed, ok := s.ruleErrorLimiter.allow(ruleErr.rule, now)
+	if !ok {
+		return
+	}
+	dropped, ok := s.logLimiter.allow(now)
+	if !ok {
+		return
+	}
+	var vars []slog.Attr
+	var condErr *condition.Error
+	if errors.As(ruleErr.err, &condErr) {
+		for _, v := range condErr.Vars {
+			vars = append(vars, conditionVarAttr(v))
+		}
+	}
+	line := append(c.addrs(), slog.String("rule", ruleErr.rule), slog.GroupAttrs("vars", vars...), suppressed, dropped, logging.Error(ruleErr.err))
+	s.logger.LogAttrs(context.Background(), slog.LevelWarn, "rule failed", line...)
+}
+
+// trustedVars are the variables of conditions that clients do not send,
+// logged as plain strings like on the other lines. The others, and the ones to
+// come, are untrusted.
+var trustedVars = map[string]bool{"event": true, "legacy_ping_version": true, "ip": true, "listener": true}
+
+// conditionVarAttr returns the attribute logging v as the other lines log the
+// same value.
+func conditionVarAttr(v condition.Var) slog.Attr {
+	switch value := v.Value.(type) {
+	case string:
+		if trustedVars[v.Name] {
+			return slog.String(v.Name, value)
+		}
+		return logging.Untrusted(v.Name, value)
+	case int:
+		return slog.Int(v.Name, value)
+	case bool:
+		return slog.Bool(v.Name, value)
+	}
+	return slog.Any(v.Name, v.Value)
 }
 
 func (s *Server) logRejected(msg string, c *connInfo) {
@@ -243,6 +304,52 @@ func (h *headRecorder) restart(r *bufio.Reader) {
 
 func (h *headRecorder) bytes() []byte {
 	return h.buf[:h.n]
+}
+
+// ruleErrorInterval is how often each rule that keeps failing is logged.
+const ruleErrorInterval = time.Minute
+
+// ruleErrorLimiter bounds the rule failed lines of each rule to one per
+// ruleErrorInterval, so that a rule failing for many clients does not repeat
+// the same line for each, nor take the lines of the others. Suppressed lines
+// are counted and reported by the next line of the rule. Its zero value is
+// ready to use.
+type ruleErrorLimiter struct {
+	mu    sync.Mutex
+	rules map[string]*ruleErrors // By rule name: as many as the rules.
+}
+
+type ruleErrors struct {
+	logged     time.Time
+	suppressed int
+}
+
+// allow reports whether a failure of rule can be logged now and, if so, an
+// attribute counting the ones of rule suppressed before it (empty if none, so
+// not logged). The count restarts even if logLimiter then drops the line,
+// which dropped= reports.
+func (l *ruleErrorLimiter) allow(rule string, now time.Time) (slog.Attr, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	errs := l.rules[rule]
+	if errs == nil {
+		if l.rules == nil {
+			l.rules = make(map[string]*ruleErrors)
+		}
+		errs = &ruleErrors{}
+		l.rules[rule] = errs
+	} else if now.Sub(errs.logged) < ruleErrorInterval {
+		errs.suppressed++
+		return slog.Attr{}, false
+	}
+
+	var suppressed slog.Attr
+	if errs.suppressed > 0 {
+		suppressed = slog.Int("suppressed", errs.suppressed)
+	}
+	errs.logged, errs.suppressed = now, 0
+	return suppressed, true
 }
 
 // logLimiter bounds how many lines are logged per second, so that floods

@@ -36,13 +36,24 @@ type Rule struct {
 }
 
 // matches reports whether the client of sess matches all the conditions of r.
+// A condition that fails does not match, and its error is recorded in sess.
 func (r Rule) matches(sess *session) bool {
 	for _, cond := range r.Conditions {
-		if !cond.Match(sess.conditionClient()) {
+		ok, err := cond.Match(sess.conditionClient())
+		if err != nil {
+			sess.ruleErrors = append(sess.ruleErrors, ruleError{rule: r.Name, err: err})
+		}
+		if !ok {
 			return false
 		}
 	}
 	return true
+}
+
+// ruleError is the error of a rule whose condition failed.
+type ruleError struct {
+	rule string
+	err  error
 }
 
 // ClientProtocol is when to report the protocol version of each client in

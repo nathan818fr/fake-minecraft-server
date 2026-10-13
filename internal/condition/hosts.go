@@ -26,8 +26,8 @@ func Hosts(patterns []string) (Condition, error) {
 	return c, nil
 }
 
-func (c hosts) Match(client *Client) bool {
-	return matchHost(c, client.Host)
+func (c hosts) Match(client *Client) (bool, error) {
+	return matchHost(c, client.Host), nil
 }
 
 // parseHostPattern returns the host pattern made of text, in lowercase and

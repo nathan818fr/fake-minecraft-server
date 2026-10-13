@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"maps"
@@ -269,6 +270,69 @@ func TestLogLimiter(t *testing.T) {
 	}
 }
 
+// Each rule that keeps failing is logged once per interval, with the count of
+// its lines suppressed in between, independently of the other rules.
+func TestRuleErrorLimiter(t *testing.T) {
+	var l ruleErrorLimiter
+	start := time.Unix(1000, 0)
+
+	for _, rule := range []string{"a", "b"} {
+		if suppressed, ok := l.allow(rule, start); !ok || !suppressed.Equal(slog.Attr{}) {
+			t.Fatalf("first failure of %s: allow() = %v, %v, want an allowed line without suppressed ones", rule, suppressed, ok)
+		}
+	}
+	for i := range 3 {
+		if _, ok := l.allow("a", start.Add(ruleErrorInterval-time.Millisecond)); ok {
+			t.Fatalf("failure %d of a within the interval was allowed", i)
+		}
+	}
+
+	suppressed, ok := l.allow("a", start.Add(ruleErrorInterval))
+	if !ok {
+		t.Fatal("allow() refused a failure of a after the interval")
+	}
+	if want := slog.Int("suppressed", 3); !suppressed.Equal(want) {
+		t.Errorf("allow() reported %v, want %v", suppressed, want)
+	}
+	if suppressed, ok := l.allow("b", start.Add(ruleErrorInterval)); !ok || !suppressed.Equal(slog.Attr{}) {
+		t.Errorf("failure of b after the interval: allow() = %v, %v, want an allowed line without suppressed ones", suppressed, ok)
+	}
+}
+
+// Failures that the log level hides are not counted either.
+func TestRuleErrorLimiterSkipsHiddenLines(t *testing.T) {
+	s := &Server{logger: slog.New(logging.NewTextHandler(io.Discard, slog.LevelError))}
+	s.logRuleError(&connInfo{}, ruleError{rule: "a", err: errors.New("failed")})
+	if len(s.ruleErrorLimiter.rules) != 0 {
+		t.Errorf("hidden failures were counted: %v", s.ruleErrorLimiter.rules)
+	}
+}
+
+// A rule that fails for every client logs one rule failed line, and every
+// connection line tells that it failed.
+func TestLoggingRuleErrorSuppressed(t *testing.T) {
+	var logs bytes.Buffer
+	cfg := withWhenRules(t, testConfig, `event == "ping" and (protocol != 777 or int(host) > 0)`, `False`)
+	addr, stop := startServerWithLogger(t, cfg, slog.New(logging.NewTextHandler(&logs, nil)))
+	for range 3 {
+		c := dial(t, addr)
+		c.statusExchange(777)
+		_ = c.conn.Close()
+	}
+	stop()
+
+	if n := strings.Count(logs.String(), " rule failed: "); n != 1 {
+		t.Errorf("logs = %q, want 1 rule failed line, got %d", logs.String(), n)
+	}
+	// Strings that clients do not send are not quoted, like on the other lines.
+	if want := ` vars.event=ping vars.host="localhost" vars.protocol=777 `; !strings.Contains(logs.String(), want) {
+		t.Errorf("logs = %q, want them to contain %q", logs.String(), want)
+	}
+	if n := strings.Count(logs.String(), " failed_rules=a "); n != 3 {
+		t.Errorf("logs = %q, want 3 connection lines with failed_rules=a, got %d", logs.String(), n)
+	}
+}
+
 // Statuses are logged with their source, so that operators see when the
 // static status takes over.
 func TestLoggingStatusOfUpstream(t *testing.T) {
@@ -287,6 +351,29 @@ func TestLoggingStatusOfUpstream(t *testing.T) {
 
 	if want := " rule=0 server=test source=upstream ping_request=false "; !strings.Contains(logs.String(), want) {
 		t.Errorf("logs = %q, want them to contain %q", logs.String(), want)
+	}
+}
+
+// Conditions that fail are logged, and do not apply.
+func TestLoggingRuleError(t *testing.T) {
+	var logs bytes.Buffer
+	cfg := withWhenRules(t, testConfig, `matches(host, host_extra or "^$")`, `False`)
+	addr, stop := startServerWithLogger(t, cfg, slog.New(logging.NewTextHandler(&logs, nil)))
+	c := dial(t, addr)
+	c.write(modernproto.AppendHandshake(nil, modernproto.Handshake{
+		ProtocolVersion: 777, ServerAddress: "localhost", ServerAddressExtra: "(", ServerPort: 25565, Intent: modernproto.IntentLogin,
+	}))
+	c.readPacket(modernproto.LoginDisconnectID)
+	_ = c.conn.Close()
+	stop()
+
+	for _, want := range []string{
+		`WARN  \[127\.0\.0\.1\]:\d+ rule failed: rule=a vars\.host="localhost" vars\.host_extra="\(" error="matches: error parsing regexp: missing closing \): ` + "`\\(`" + `"`,
+		`INFO  \S+ login attempt: protocol=777 host="localhost" host_extra="\(" port=25565 rule=0 server=test failed_rules=a `,
+	} {
+		if !regexp.MustCompile(`(?m)^\[\S+\] ` + want).MatchString(logs.String()) {
+			t.Errorf("logs = %q, want a line matching %q", logs.String(), want)
+		}
 	}
 }
 
