@@ -134,11 +134,12 @@ func hostAttrs(host, extra string, port uint16) []slog.Attr {
 }
 
 // ruleAttrs returns the attributes telling which rule and virtual server
-// answered sess, if any.
+// answered sess, if any, and where its status came from, for status requests.
 func ruleAttrs(sess *session) []slog.Attr {
 	return []slog.Attr{
 		optionalString("rule", sess.rule),
 		optionalString("server", sess.server),
+		optionalString("source", string(sess.statusSource)),
 	}
 }
 

@@ -24,6 +24,7 @@ import (
 	"github.com/nathan818fr/fake-minecraft-server/internal/condition"
 	"github.com/nathan818fr/fake-minecraft-server/internal/modernproto"
 	"github.com/nathan818fr/fake-minecraft-server/internal/status"
+	"github.com/nathan818fr/fake-minecraft-server/internal/upstream"
 )
 
 const clientTimeout = 2 * time.Second
@@ -79,22 +80,29 @@ func startServer(t testing.TB, cfg Config) string {
 // for its connections to finish.
 func startServerWithLogger(t testing.TB, cfg Config, logger *slog.Logger) (string, func()) {
 	t.Helper()
-	return startServerWithOptions(t, cfg, logger, ListenerOptions{})
+	return startServerWithUpstreams(t, cfg, nil, logger)
 }
 
-// startServerWithOptions is like startServerWithLogger, with the options of
+// startServerWithUpstreams is like startServerWithLogger, with upstreams in
+// place of the pollers of cfg.Upstreams, such as fakes.
+func startServerWithUpstreams(t testing.TB, cfg Config, upstreams map[string]Upstream, logger *slog.Logger) (string, func()) {
+	t.Helper()
+	return startServerWithOptions(t, cfg, upstreams, logger, ListenerOptions{})
+}
+
+// startServerWithOptions is like startServerWithUpstreams, with the options of
 // its listener.
-func startServerWithOptions(t testing.TB, cfg Config, logger *slog.Logger, options ListenerOptions) (string, func()) {
+func startServerWithOptions(t testing.TB, cfg Config, upstreams map[string]Upstream, logger *slog.Logger, options ListenerOptions) (string, func()) {
 	t.Helper()
 	ln := listenTCP(t)
-	return ln.Addr().String(), serve(t, cfg, logger, Listener{Listener: ln, Options: options})
+	return ln.Addr().String(), serve(t, cfg, upstreams, logger, Listener{Listener: ln, Options: options})
 }
 
 // startProxiedServer is like startServer, with the PROXY protocol (see
 // testProxyProtocol).
 func startProxiedServer(t testing.TB, cfg Config) string {
 	t.Helper()
-	addr, _ := startServerWithOptions(t, cfg, slog.New(slog.DiscardHandler), testProxyProtocol)
+	addr, _ := startServerWithOptions(t, cfg, nil, slog.New(slog.DiscardHandler), testProxyProtocol)
 	return addr
 }
 
@@ -107,13 +115,14 @@ func listenTCP(t testing.TB) net.Listener {
 	return ln
 }
 
-// serve serves the listeners and returns a function that stops the server and
-// waits for its connections to finish.
-func serve(t testing.TB, cfg Config, logger *slog.Logger, listeners ...Listener) func() {
+// serve serves the listeners with the server made of cfg and upstreams (see
+// newServer), and returns a function that stops it and waits for its
+// connections to finish.
+func serve(t testing.TB, cfg Config, upstreams map[string]Upstream, logger *slog.Logger, listeners ...Listener) func() {
 	t.Helper()
-	srv, err := New(cfg, logger)
+	srv, err := newServer(cfg, upstreams, logger)
 	if err != nil {
-		t.Fatalf("New() error: %v", err)
+		t.Fatalf("newServer() error: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -308,6 +317,100 @@ func TestStatusSignature(t *testing.T) {
 		if got := c.readString(modernproto.StatusResponseID); got != want {
 			t.Errorf("status %s: got %s, want %s", data, got, want)
 		}
+	}
+}
+
+type fakeUpstream struct{ st *status.Status }
+
+func (fakeUpstream) Run(context.Context) {}
+
+func (u fakeUpstream) Status() *status.Status { return u.st }
+
+// The status of the upstream of a server is answered while it has one, and its
+// static status otherwise. Servers that no rule targets are not answered.
+func TestStatusOfUpstream(t *testing.T) {
+	live, err := status.Parse([]byte(`{"description":"Live","version":{"name":"Real 1.0","protocol":47}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name     string
+		upstream Upstream
+		want     string
+	}{
+		{"available", fakeUpstream{live}, `"Live"`},
+		{"unavailable", fakeUpstream{nil}, `{"text":"Hello"}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := withServer(testConfig, func(server *VirtualServer) { server.Upstream = "live" })
+			cfg.Servers["other"] = VirtualServer{Upstream: "other", Kick: json.RawMessage(testKick)}
+			upstreams := map[string]Upstream{"live": tc.upstream, "other": fakeUpstream{live}}
+			addr, _ := startServerWithUpstreams(t, cfg, upstreams, slog.New(slog.DiscardHandler))
+			if got := dial(t, addr).statusExchange(777)["description"]; string(got) != tc.want {
+				t.Errorf("description = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// runningUpstream is a fake upstream that tells when it starts and stops
+// running.
+type runningUpstream struct {
+	fakeUpstream
+	started, stopped chan struct{}
+}
+
+func (u runningUpstream) Run(ctx context.Context) {
+	close(u.started)
+	<-ctx.Done()
+	close(u.stopped)
+}
+
+// The upstreams run while the server serves, and stop before Serve returns.
+func TestServeRunsUpstreams(t *testing.T) {
+	u := runningUpstream{started: make(chan struct{}), stopped: make(chan struct{})}
+	cfg := withServer(testConfig, func(server *VirtualServer) { server.Upstream = "live" })
+	_, stop := startServerWithUpstreams(t, cfg, map[string]Upstream{"live": u}, slog.New(slog.DiscardHandler))
+	select {
+	case <-u.started:
+	case <-time.After(clientTimeout):
+		t.Fatal("the upstream did not start")
+	}
+	stop()
+	select {
+	case <-u.stopped:
+	default:
+		t.Error("Serve returned before the upstream stopped")
+	}
+}
+
+// The rules are tried in order, and those whose server has no status right now
+// are skipped.
+func TestRules(t *testing.T) {
+	live, err := status.Parse([]byte(`{"description":"Live"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name     string
+		upstream Upstream
+		want     string
+	}{
+		{"first rule", fakeUpstream{live}, `"Live"`},
+		{"next rule", fakeUpstream{nil}, `{"text":"Hello"}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig
+			cfg.Servers = maps.Clone(cfg.Servers)
+			cfg.Servers["lobby"] = VirtualServer{Upstream: "lobby", Kick: json.RawMessage(testKick)}
+			cfg.Rules = []Rule{{Server: "lobby"}, {Server: testServerID}}
+			addr, _ := startServerWithUpstreams(t, cfg, map[string]Upstream{"lobby": tc.upstream}, slog.New(slog.DiscardHandler))
+			if got := dial(t, addr).statusExchange(777)["description"]; string(got) != tc.want {
+				t.Errorf("description = %s, want %s", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -696,7 +799,7 @@ func TestHandshakeTimeout(t *testing.T) {
 			if tc.setup != nil {
 				tc.setup(&cfg, &options)
 			}
-			addr, _ := startServerWithOptions(t, cfg, slog.New(slog.DiscardHandler), options)
+			addr, _ := startServerWithOptions(t, cfg, nil, slog.New(slog.DiscardHandler), options)
 			c := dial(t, addr)
 			c.write(tc.data)
 
@@ -763,10 +866,14 @@ func TestNewRejectsInvalidConfig(t *testing.T) {
 		}},
 		{"no rules", func(cfg *Config) { cfg.Rules = nil }},
 		{"rule with an unknown server", func(cfg *Config) { cfg.Rules = []Rule{{Server: "other"}, {Server: testServerID}} }},
-		{"last rule with a server without status", func(cfg *Config) {
+		{"last rule with a server without static status", func(cfg *Config) {
 			cfg.Servers = maps.Clone(cfg.Servers)
-			cfg.Servers["lobby"] = VirtualServer{Kick: json.RawMessage(testKick)}
+			cfg.Upstreams = map[string]upstream.Config{"lobby": {}}
+			cfg.Servers["lobby"] = VirtualServer{Upstream: "lobby", Kick: json.RawMessage(testKick)}
 			cfg.Rules = []Rule{{Server: testServerID}, {Server: "lobby"}}
+		}},
+		{"server with an unknown upstream", func(cfg *Config) {
+			*cfg = withServer(*cfg, func(server *VirtualServer) { server.Upstream = "missing" })
 		}},
 		{"oversized kick message of a server", func(cfg *Config) {
 			*cfg = withServer(*cfg, func(server *VirtualServer) {

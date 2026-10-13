@@ -7,6 +7,7 @@ package config
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -25,12 +26,13 @@ import (
 
 	"github.com/nathan818fr/fake-minecraft-server/internal/condition"
 	"github.com/nathan818fr/fake-minecraft-server/internal/logging"
+	"github.com/nathan818fr/fake-minecraft-server/internal/modernproto"
 	"github.com/nathan818fr/fake-minecraft-server/internal/server"
 	"github.com/nathan818fr/fake-minecraft-server/internal/status"
+	"github.com/nathan818fr/fake-minecraft-server/internal/upstream"
 )
 
 const (
-	defaultPort                = 25565
 	defaultKickMessage         = "§cNot available"
 	defaultConnectionTimeout   = 3 * time.Second
 	defaultHandshakeTimeout    = time.Second
@@ -49,6 +51,16 @@ const (
 	// defaultStatus is the built-in status of the default server, used unless
 	// the configuration file sets one (see addDefaultServer).
 	defaultStatus = `{"description":{"text":"` + defaultKickMessage + `"},"players":{"max":0,"online":0,"sample":[]}}`
+
+	// defaultUpstreamProtocolVersion is the convention for asking a server for
+	// its own version.
+	defaultUpstreamProtocolVersion = -1
+	defaultUpstreamInterval        = 10 * time.Second
+	defaultUpstreamRetryInterval   = 10 * time.Second
+	defaultUpstreamTimeout         = 5 * time.Second
+	// defaultUpstreamMaxAgeIntervals is the default max_age, in intervals, so
+	// that a server is unavailable after a few failed polls.
+	defaultUpstreamMaxAgeIntervals = 3
 )
 
 type Config struct {
@@ -82,8 +94,9 @@ type settings struct {
 	// statuses (see server.Config).
 	NoSoftwareSignature bool `yaml:"no_software_signature"`
 
-	Servers map[string]serverSettings `yaml:"servers"`
-	Rules   []ruleSettings            `yaml:"rules"`
+	Upstreams map[string]upstreamSettings `yaml:"upstreams"`
+	Servers   map[string]serverSettings   `yaml:"servers"`
+	Rules     []ruleSettings              `yaml:"rules"`
 }
 
 // listenSettings are the settings of a listener: its address, written alone,
@@ -116,11 +129,31 @@ type logSettings struct {
 type statusSettings = map[string]any
 
 type serverSettings struct {
-	Status         statusSettings `yaml:"status"`
-	ClientProtocol string         `yaml:"client_protocol"`
+	Status statusSettings `yaml:"status"`
+	// Upstream is the ID of an upstream, by default the one of the server, or
+	// "" for none.
+	Upstream       optional[string] `yaml:"upstream"`
+	ClientProtocol string           `yaml:"client_protocol"`
 	// Kick is plain text, or a JSON text component written in YAML or in
 	// JSON.
 	Kick any `yaml:"kick"`
+}
+
+type upstreamSettings struct {
+	Address       string                  `yaml:"address"`
+	Handshake     handshakeSettings       `yaml:"handshake"`
+	Interval      optional[time.Duration] `yaml:"interval"`
+	RetryInterval optional[time.Duration] `yaml:"retry_interval"`
+	Timeout       optional[time.Duration] `yaml:"timeout"`
+	MaxAge        optional[time.Duration] `yaml:"max_age"`
+}
+
+// handshakeSettings are the values that the handshake of polls sends, by
+// default the ones of the address, as clients send them.
+type handshakeSettings struct {
+	Host     string          `yaml:"host"`
+	Port     optional[int]   `yaml:"port"`
+	Protocol optional[int32] `yaml:"protocol"`
 }
 
 type ruleSettings struct {
@@ -157,7 +190,7 @@ func (s *settings) resolvePaths(dir string) {
 
 // checker collects the mistakes found while checking settings, named after
 // the key of their setting, such as "connections.max" or
-// "servers.lobby.kick".
+// "upstreams.lobby.address".
 type checker struct {
 	errs []error
 }
@@ -187,8 +220,9 @@ func (s *settings) check() (Config, []error) {
 	cfg.LogLevel = c.logLevel(s.Log.Level)
 	cfg.Server.LogRateLimit = c.count("log.rate_limit", s.Log.RateLimit, defaultLogRateLimit)
 
+	cfg.Server.Upstreams = c.upstreams(s.Upstreams)
 	cfg.Server.SoftwareSignature = !s.NoSoftwareSignature
-	cfg.Server.Servers = c.servers(s.Servers, cfg.Server.SoftwareSignature)
+	cfg.Server.Servers = c.servers(s.Servers, s.Upstreams, cfg.Server.SoftwareSignature)
 	cfg.Server.Rules = c.rules(s.Rules, cfg.Server.Servers)
 	return cfg, c.errs
 }
@@ -210,10 +244,22 @@ func (c *checker) count(key string, n optional[int], def int) int {
 	return n.or(def)
 }
 
+// port returns the port at key, or def if unset.
+func (c *checker) port(key string, p optional[int], def uint16) uint16 {
+	if !p.set {
+		return def
+	}
+	if p.value < 1 || p.value > math.MaxUint16 {
+		c.failf(key, "must be between 1 and %d, got %d", math.MaxUint16, p.value)
+		return def
+	}
+	return uint16(p.value)
+}
+
 // listeners returns the listeners, or the default one if there are none.
 func (c *checker) listeners(entries []listenSettings) []Listener {
 	if len(entries) == 0 {
-		return []Listener{{Network: "tcp", Address: ":" + strconv.Itoa(defaultPort)}}
+		return []Listener{{Network: "tcp", Address: ":" + strconv.Itoa(modernproto.DefaultPort)}}
 	}
 	var listeners []Listener
 	for i, entry := range entries {
@@ -306,9 +352,9 @@ func (c *checker) trustedProxies(key string, entry listenSettings, network strin
 	return prefixes
 }
 
-// checkID checks the ID of a server, at key. IDs are limited to the characters
-// of environment variable names, in lowercase, so that each one can be set by a
-// variable.
+// checkID checks the ID of a server or upstream, at key. IDs are limited to the
+// characters of environment variable names, in lowercase, so that each one can
+// be set by a variable.
 func (c *checker) checkID(key, id string) {
 	if !isID(id) {
 		c.failf(key, "the ID must be made of lowercase letters, digits and underscores, got %q", id)
@@ -321,19 +367,84 @@ func isID(s string) bool {
 	}) < 0
 }
 
+// upstreams returns the configurations of the upstreams, by ID.
+func (c *checker) upstreams(entries map[string]upstreamSettings) map[string]upstream.Config {
+	configs := make(map[string]upstream.Config, len(entries))
+	for _, id := range slices.Sorted(maps.Keys(entries)) {
+		key := "upstreams." + id
+		c.checkID(key, id)
+		configs[id] = c.upstream(key, entries[id])
+	}
+	return configs
+}
+
+// upstream returns the configuration of the upstream at key, with the
+// defaults of the options it does not set.
+func (c *checker) upstream(key string, s upstreamSettings) upstream.Config {
+	host, port, err := parseServerAddr(s.Address)
+	if err != nil {
+		c.fail(key+".address", err)
+	}
+	interval := c.duration(key+".interval", s.Interval, defaultUpstreamInterval)
+	// At most the interval by default, so that a short interval works without
+	// also setting them.
+	retryInterval := c.duration(key+".retry_interval", s.RetryInterval, min(defaultUpstreamRetryInterval, interval))
+	timeout := c.duration(key+".timeout", s.Timeout, min(defaultUpstreamTimeout, interval))
+	// The last status must stay in use for at least the longest time between
+	// two successful polls.
+	longest := interval + timeout
+	maxAge := c.duration(key+".max_age", s.MaxAge, max(defaultUpstreamMaxAgeIntervals*interval, longest))
+	if s.MaxAge.set && interval > 0 && timeout > 0 && maxAge > 0 && maxAge < longest {
+		c.failf(key+".max_age", "must be at least interval + timeout (%s), the longest time between two successful polls, got %s", longest, maxAge)
+	}
+	// Like clients in their server list, the handshake has the address as
+	// written by default, even when an SRV record gives another one.
+	return upstream.Config{
+		Host:            host,
+		Port:            port,
+		ServerAddress:   cmp.Or(s.Handshake.Host, host),
+		ServerPort:      c.port(key+".handshake.port", s.Handshake.Port, cmp.Or(port, modernproto.DefaultPort)),
+		ProtocolVersion: s.Handshake.Protocol.or(defaultUpstreamProtocolVersion),
+		Interval:        interval,
+		RetryInterval:   retryInterval,
+		Timeout:         timeout,
+		MaxAge:          maxAge,
+	}
+}
+
 // servers returns the virtual servers, the default one among them (see
-// addDefaultServer). The default server answers what the others do not:
+// addDefaultServer). A server uses the upstream with its own ID unless it sets
+// another one, or none (""), and an upstream without a server makes one, with
+// only that upstream. The default server answers what the others do not:
 // statuses, through the implicit last rule, and joins to servers without a
 // kick message.
-func (c *checker) servers(entries map[string]serverSettings, signed bool) map[string]server.VirtualServer {
-	ids := slices.Sorted(maps.Keys(entries))
+func (c *checker) servers(entries map[string]serverSettings, upstreams map[string]upstreamSettings, signed bool) map[string]server.VirtualServer {
+	ids := slices.Collect(maps.Keys(entries))
+	for id := range upstreams {
+		if _, ok := entries[id]; !ok {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+
 	servers := make(map[string]server.VirtualServer, len(ids))
 	for _, id := range ids {
 		key, entry := "servers."+id, entries[id]
 		vs := server.VirtualServer{ClientProtocol: c.clientProtocol(key+".client_protocol", entry.ClientProtocol)}
-		c.checkID(key, id)
-		if entry.Status == nil && entry.Kick == nil {
-			c.failf(key, "must have a status or a kick message")
+		if _, ok := upstreams[id]; ok {
+			vs.Upstream = id
+		}
+		if entry.Upstream.set {
+			vs.Upstream = entry.Upstream.value
+			if _, ok := upstreams[vs.Upstream]; !ok && vs.Upstream != "" {
+				c.failf(key+".upstream", "no upstream has the ID %q", vs.Upstream)
+			}
+		}
+		if _, ok := entries[id]; ok {
+			c.checkID(key, id)
+			if entry.Status == nil && vs.Upstream == "" && entry.Kick == nil {
+				c.failf(key, "must have a status, an upstream or a kick message")
+			}
 		}
 		if entry.Status != nil {
 			vs.Status = c.status(key+".status", entry.Status, vs.ClientProtocol, signed)
@@ -497,6 +608,30 @@ func parseListenAddr(s string) (Listener, error) {
 		return Listener{}, fmt.Errorf("%q has an invalid port, must be between 1 and %d", s, math.MaxUint16)
 	}
 	return Listener{Network: "tcp", Address: s}, nil
+}
+
+// parseServerAddr parses a host or host:port address, with IPv6 addresses in
+// brackets. The port is 0 if the address has none.
+func parseServerAddr(s string) (host string, port uint16, err error) {
+	if s == "" {
+		return "", 0, errors.New("must be set")
+	}
+	host, portText, err := net.SplitHostPort(s)
+	hasPort := err == nil
+	if !hasPort {
+		host, _, err = net.SplitHostPort(s + ":0")
+	}
+	if err != nil || host == "" {
+		return "", 0, fmt.Errorf("%q must be host or host:port", s)
+	}
+	if !hasPort {
+		return host, 0, nil
+	}
+	n, err := strconv.Atoi(portText)
+	if err != nil || n < 1 || n > math.MaxUint16 {
+		return "", 0, fmt.Errorf("%q has an invalid port, must be between 1 and %d", s, math.MaxUint16)
+	}
+	return host, uint16(n), nil
 }
 
 // ipv4MappedPrefixBits is the length of the prefix of IPv4-mapped IPv6

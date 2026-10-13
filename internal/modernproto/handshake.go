@@ -27,6 +27,10 @@ const maxServerAddressBytes = 255
 
 const serverPortLength = 2
 
+// DefaultPort is the port of servers whose address has none, nor an SRV
+// record.
+const DefaultPort = 25565
+
 // MaxHandshakePayloadLength is the length of a handshake payload with the
 // longest fields: protocol version, server address (after its 2-byte length),
 // port and intent (1 byte).

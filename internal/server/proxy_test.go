@@ -83,7 +83,7 @@ func TestProxyProtocolTrustedProxies(t *testing.T) {
 				options.TrustedProxies = []netip.Prefix{netip.MustParsePrefix(tc.trusted)}
 			}
 			var logs bytes.Buffer
-			addr, stop := startServerWithOptions(t, testConfig, slog.New(logging.NewTextHandler(&logs, nil)), options)
+			addr, stop := startServerWithOptions(t, testConfig, nil, slog.New(logging.NewTextHandler(&logs, nil)), options)
 			if !tc.allowed {
 				expectRejected(t, addr) // Without waiting for the header.
 				stop()
@@ -111,7 +111,7 @@ func TestProxyProtocolTrustedLinkLocalProxy(t *testing.T) {
 // require a header.
 func TestProxyProtocolPerListener(t *testing.T) {
 	direct, proxied := listenTCP(t), listenTCP(t)
-	serve(t, testConfig, slog.New(slog.DiscardHandler), Listener{Listener: direct}, Listener{Listener: proxied, Options: testProxyProtocol})
+	serve(t, testConfig, nil, slog.New(slog.DiscardHandler), Listener{Listener: direct}, Listener{Listener: proxied, Options: testProxyProtocol})
 
 	dial(t, direct.Addr().String()).statusExchange(777)
 	c := dial(t, proxied.Addr().String())

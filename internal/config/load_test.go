@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -14,8 +15,8 @@ import (
 	"github.com/nathan818fr/fake-minecraft-server/internal/server"
 )
 
-// Every setting has a variable named after its key, and every server one named
-// after its ID.
+// Every setting has a variable named after its key, and every upstream and
+// server one named after its ID.
 func TestVariables(t *testing.T) {
 	want := []string{
 		"LISTEN",
@@ -27,6 +28,8 @@ func TestVariables(t *testing.T) {
 		"LOG_LEVEL",
 		"LOG_RATE_LIMIT",
 		"NO_SOFTWARE_SIGNATURE",
+		"UPSTREAMS_Creative_1",
+		"UPSTREAMS_LOBBY",
 		"SERVERS_DEFAULT",
 		"SERVERS_LOBBY",
 		"RULES",
@@ -66,7 +69,7 @@ func TestVariableValues(t *testing.T) {
 
 		"SERVERS_DEFAULT":     `{"status":{"description":"Hello","favicon":"icon.png","players":{"max":100,"online":2}},"kick":{"text":"Bye","color":"red"}}`,
 		"SERVERS_MAINTENANCE": "{ status: { description: Maintenance, version: { name: Fake, protocol: -1 } }, client_protocol: never, kick: Closed }",
-		"SERVERS_LOBBY":       "{ status: { description: Lobby } }",
+		"UPSTREAMS_LOBBY":     "{ address: lobby.example.com, interval: 1m }",
 		"RULES":               "[{ name: lobby, host: [lobby.example.com], server: lobby }, { server: maintenance }]",
 	})
 	if err != nil {
@@ -112,6 +115,9 @@ func TestVariableValues(t *testing.T) {
 			t.Errorf("server %s: kick message = %s, want %s", id, got, want)
 		}
 	}
+	if got := cfg.Server.Upstreams["lobby"]; got.Host != "lobby.example.com" || got.Interval != time.Minute {
+		t.Errorf("lobby upstream = %+v, want lobby.example.com polled every minute", got)
+	}
 }
 
 // Variables take the same values as the file, except for text and lists.
@@ -136,16 +142,16 @@ func TestVariablesReadLikeFile(t *testing.T) {
 }
 
 func TestVariablesEmptyAreUnset(t *testing.T) {
-	cfg, err := loadFile(t, "connections: { max: 10 }\nservers:\n  lobby: { kick: Bye }\n",
-		map[string]string{"LISTEN": "", "CONNECTIONS_MAX": "", "SERVERS_LOBBY": ""})
+	cfg, err := loadFile(t, "connections: { max: 10 }\nupstreams:\n  lobby: { address: lobby.example.com }\n",
+		map[string]string{"LISTEN": "", "CONNECTIONS_MAX": "", "UPSTREAMS_LOBBY": ""})
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
 	if want := []Listener{{Network: "tcp", Address: ":25565"}}; !reflect.DeepEqual(cfg.Listeners, want) {
 		t.Errorf("Listeners = %v, want %v", cfg.Listeners, want)
 	}
-	if cfg.Server.MaxConnections != 10 || string(cfg.Server.Servers["lobby"].Kick) != `{"text":"Bye"}` {
-		t.Errorf("MaxConnections = %d, servers = %v, want the ones of the file", cfg.Server.MaxConnections, cfg.Server.Servers)
+	if cfg.Server.MaxConnections != 10 || len(cfg.Server.Upstreams) != 1 {
+		t.Errorf("MaxConnections = %d, upstreams = %v, want the ones of the file", cfg.Server.MaxConnections, cfg.Server.Upstreams)
 	}
 }
 
@@ -164,8 +170,9 @@ servers:
       version: { name: "1.21.10", protocol: 773 }
   lobby:
     kick: Lobby down
-  creative:
-    kick: Creative
+upstreams:
+  lobby: { address: lobby.example.com, interval: 1m, handshake: { host: play.example.com } }
+  creative: { address: creative.example.com }
 rules: [{ server: lobby }, { server: default }]
 `)
 	// The favicon of the file stays relative to the file.
@@ -177,6 +184,8 @@ rules: [{ server: lobby }, { server: default }]
 		"CONNECTIONS_MAX":     "20",
 		"SERVERS_DEFAULT":     `{"status":{"players":{"online":5,"sample":null},"version":{"name":"Fake"}},"client_protocol":"always"}`,
 		"SERVERS_MAINTENANCE": "{ status: { description: Maintenance } }",
+		"UPSTREAMS_LOBBY":     "{ address: lobby2.example.com, handshake: { port: 25566 } }",
+		"UPSTREAMS_HUB":       "{ address: hub.example.com }",
 	})
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
@@ -209,6 +218,15 @@ rules: [{ server: lobby }, { server: default }]
 	if got, want := statusJSON(t, cfg, "maintenance"), `{"description":"Maintenance"}`; got != want {
 		t.Errorf("maintenance status = %s, want %s", got, want)
 	}
+
+	lobby := cfg.Server.Upstreams["lobby"]
+	if lobby.Host != "lobby2.example.com" || lobby.ServerAddress != "play.example.com" || lobby.ServerPort != 25566 || lobby.Interval != time.Minute {
+		t.Errorf("lobby upstream = %+v, want lobby2.example.com, with the handshake port of the variable, the handshake host"+
+			" and interval of the file", lobby)
+	}
+	if got := slices.Sorted(maps.Keys(cfg.Server.Upstreams)); !slices.Equal(got, []string{"creative", "hub", "lobby"}) {
+		t.Errorf("upstreams = %v, want creative, hub and lobby", got)
+	}
 }
 
 // Errors must tell what is expected, with the same words for variables and
@@ -230,6 +248,10 @@ func TestVariableErrors(t *testing.T) {
 		{"SERVERS_DEFAULT", "{\n  kick: Bye\n}\n}\n", "line 4: unexpected content after the value"},
 		{"SERVERS_DEFAULT", "kick: Bye\n---\nkick: Hi\n", "line 2: only one YAML document is allowed"},
 		{"RULES", "[{ server: default }]]", "unexpected content after the value"},
+		{"SERVERS_LOBBY", "{ upstream: { address: lobby.example.com } }", "must be text, got a mapping"},
+		{"UPSTREAMS_LOBBY", "lobby.example.com", "must be a mapping, got `lobby.e...`"},
+		{"UPSTREAMS_LOBBY", "{ address: lobby.example.com, port: 25565 }", "unknown key port"},
+		{"UPSTREAMS_LOBBY", "{ address: lobby.example.com, interval: 10 }", "must be a duration such as \"3s\" or \"500ms\", got `10`"},
 	}
 	for _, tc := range tests {
 		if _, err := loadEnv(map[string]string{tc.name: tc.value}); err == nil || err.Error() != tc.name+": "+tc.want {
@@ -242,7 +264,7 @@ func TestVariableErrors(t *testing.T) {
 // cannot be parsed, whose settings are left as in the file, then the ones of
 // the settings.
 func TestVariablesReportAllErrors(t *testing.T) {
-	_, err := loadFile(t, "connections: { max_per_ip: -1 }\n", map[string]string{
+	_, err := loadFile(t, "connections: { max_per_ip: -1 }\nupstreams:\n  lobby: { address: lobby.example.com:0 }\n", map[string]string{
 		"LISTEN": "unix:",
 
 		"CONNECTIONS_TIMEOUT":           "3",
@@ -255,11 +277,13 @@ func TestVariablesReportAllErrors(t *testing.T) {
 		"LOG_RATE_LIMIT": "-1",
 
 		"SERVERS_DEFAULT": "{ status: { players: 1 } }",
+		"UPSTREAMS_LOBBY": "{ timeout: 1 }",
 		"RULES":           "{ server: default }",
 	})
 	want := []string{
 		"CONNECTIONS_TIMEOUT: must be a duration such as \"3s\" or \"500ms\", got `3`",
 		"CONNECTIONS_MAX_PER_IP: must be an integer, got `x`",
+		"UPSTREAMS_LOBBY: must be a duration such as \"3s\" or \"500ms\", got `1`",
 		"RULES: must be a list, got a mapping",
 		`listen.0: "unix:" has no socket path`,
 		"connections.handshake_timeout: must be positive and at most the connection timeout (3s), got -1s",
@@ -268,6 +292,7 @@ func TestVariablesReportAllErrors(t *testing.T) {
 		`log.format: must be text or json, got "xml"`,
 		`log.level: must be debug, info, warn or error, got "verbose"`,
 		"log.rate_limit: must be between 0 and 2147483647, got -1",
+		`upstreams.lobby.address: "lobby.example.com:0" has an invalid port, must be between 1 and 65535`,
 		"servers.default.status.players: must be a JSON object, got 1",
 	}
 	if err == nil || err.Error() != strings.Join(want, "\n") {
@@ -332,7 +357,7 @@ servers:
 func TestFileEmpty(t *testing.T) {
 	for _, content := range []string{"", "# Nothing set yet.\n"} {
 		cfg, err := loadFile(t, content, nil)
-		if err != nil || cfg.Server.MaxConnections != 10000 {
+		if err != nil || len(cfg.Server.Upstreams) != 0 || cfg.Server.MaxConnections != 10000 {
 			t.Errorf("Load() with %q = %+v, %v, want the defaults", content, cfg, err)
 		}
 	}
@@ -369,6 +394,8 @@ func TestFileErrors(t *testing.T) {
 		{"rules not a list", "rules: { server: default }\n", "line 1: must be a list, got a mapping"},
 		{"rule unknown option", "rules: [{ server: default, when: x }]\n", "line 1: unknown key when"},
 		{"host as a single value", "rules: [{ host: a.example.com, server: default }]\n", "line 1: must be a list, got `a.examp...`"},
+		{"upstream unknown option", "upstreams:\n  lobby: { address: lobby.example.com, port: 25565 }\n", "line 2: unknown key port"},
+		{"invalid protocol version", "upstreams:\n  lobby:\n    address: lobby.example.com\n    handshake: { protocol: new }\n", "line 4: must be an integer, got `new`"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

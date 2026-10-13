@@ -26,7 +26,7 @@ func listenUnix(t *testing.T) net.Listener {
 func TestServeMultipleListeners(t *testing.T) {
 	tcp, unix := listenTCP(t), listenUnix(t)
 	var logs bytes.Buffer
-	stop := serve(t, testConfig, slog.New(logging.NewTextHandler(&logs, nil)), Listener{Listener: tcp}, Listener{Listener: unix})
+	stop := serve(t, testConfig, nil, slog.New(logging.NewTextHandler(&logs, nil)), Listener{Listener: tcp}, Listener{Listener: unix})
 
 	for _, c := range []*client{dial(t, tcp.Addr().String()), dialNetwork(t, "unix", unix.Addr().String())} {
 		c.statusExchange(777)
@@ -51,7 +51,7 @@ func TestUnixSocketPeers(t *testing.T) {
 		cfg := testConfig
 		cfg.MaxConnectionsPerIP = 1
 		ln := listenUnix(t)
-		serve(t, cfg, slog.New(slog.DiscardHandler), Listener{Listener: ln})
+		serve(t, cfg, nil, slog.New(slog.DiscardHandler), Listener{Listener: ln})
 
 		idle := dialNetwork(t, "unix", ln.Addr().String())
 		idle.write([]byte{0x10})
@@ -62,7 +62,7 @@ func TestUnixSocketPeers(t *testing.T) {
 	t.Run("trusted proxy", func(t *testing.T) {
 		ln := listenUnix(t)
 		var logs bytes.Buffer
-		stop := serve(t, testConfig, slog.New(logging.NewTextHandler(&logs, nil)), Listener{Listener: ln, Options: ListenerOptions{ProxyProtocol: true}})
+		stop := serve(t, testConfig, nil, slog.New(logging.NewTextHandler(&logs, nil)), Listener{Listener: ln, Options: ListenerOptions{ProxyProtocol: true}})
 
 		c := dialNetwork(t, "unix", ln.Addr().String())
 		c.write(proxyHeader("192.0.2.1:56324"))
