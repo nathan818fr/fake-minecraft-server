@@ -7,7 +7,7 @@ import (
 	"maps"
 	"slices"
 
-	"github.com/nathan818fr/fake-minecraft-server/v2/internal/condition"
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/script"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/status"
 )
 
@@ -29,7 +29,7 @@ type VirtualServer struct {
 type Rule struct {
 	// Name identifies the rule in logs.
 	Name       string
-	Conditions []condition.Condition
+	Conditions []script.Condition
 	Server     string
 }
 

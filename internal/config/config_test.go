@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nathan818fr/fake-minecraft-server/v2/internal/condition"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/logging"
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/script"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/server"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/upstream"
 )
@@ -635,11 +635,67 @@ func TestFaviconErrors(t *testing.T) {
 
 // hostConditions returns the conditions of a rule with hosts, as Load makes
 // them.
-func hostConditions(t *testing.T, patterns ...string) []condition.Condition {
+func hostConditions(t *testing.T, patterns ...string) []script.Condition {
 	t.Helper()
-	hosts, err := condition.Hosts(patterns)
+	hosts, err := script.Hosts(patterns)
 	if err != nil {
 		t.Fatalf("Hosts(%q) error: %v", patterns, err)
 	}
-	return []condition.Condition{hosts}
+	return []script.Condition{hosts}
+}
+
+// The script module, in the configuration or in a file, runs at startup.
+func TestScript(t *testing.T) {
+	cfg, err := loadFile(t, "script: |\n  OFFICE = [\"10.0.0.0/8\"]\n  print(\"loaded\", len(OFFICE))\n", nil)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if want := []string{"loaded 1"}; !slices.Equal(cfg.ScriptPrints, want) {
+		t.Errorf("ScriptPrints = %q, want %q", cfg.ScriptPrints, want)
+	}
+
+	// A file next to the configuration file, or, in a variable, in the working
+	// directory, which replaces the script of the file.
+	path := writeConfigFile(t, "script_file: rules.star\n")
+	if err := os.WriteFile(filepath.Join(filepath.Dir(path), "rules.star"), []byte("print(\"file\")\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = loadEnv(map[string]string{"FMS_CONFIG_FILE": path})
+	if err != nil || !slices.Equal(cfg.ScriptPrints, []string{"file"}) {
+		t.Errorf("Load() = %q, %v, want the script of the file next to the configuration", cfg.ScriptPrints, err)
+	}
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.WriteFile(filepath.Join(dir, "other.star"), []byte("print(\"variable\")\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = loadFile(t, "script: print(\"inline\")\n", map[string]string{"FMS_SCRIPT_FILE": "other.star"})
+	if err != nil || !slices.Equal(cfg.ScriptPrints, []string{"variable"}) {
+		t.Errorf("Load() = %q, %v, want the script of the variable", cfg.ScriptPrints, err)
+	}
+}
+
+func TestScriptErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		vars    map[string]string
+		want    string
+	}{
+		{"both in the file", "script: X = 1\nscript_file: rules.star\n", nil, "script_file: cannot be set together with script"},
+		{"both in variables", "", map[string]string{"FMS_SCRIPT": "X = 1", "FMS_SCRIPT_FILE": "rules.star"}, "FMS_SCRIPT_FILE: cannot be set together with FMS_SCRIPT"},
+		{"invalid script", "script: |\n  X = 1\n  Y = X +\n", nil, "script: 2:8: got newline, want primary expression"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := loadFile(t, tc.content, tc.vars); err == nil || err.Error() != tc.want {
+				t.Errorf("Load() error = %v, want %s", err, tc.want)
+			}
+		})
+	}
+
+	path := filepath.Join(t.TempDir(), "missing.star")
+	if _, err := loadEnv(map[string]string{"FMS_SCRIPT_FILE": path}); err == nil || !strings.HasPrefix(err.Error(), "script_file: open "+path) {
+		t.Errorf("Load() error = %v, want the file that cannot be read", err)
+	}
 }

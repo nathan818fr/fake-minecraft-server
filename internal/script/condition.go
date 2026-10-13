@@ -1,6 +1,7 @@
-// Package condition implements the conditions of rules, which tell the
-// clients that rules apply to.
-package condition
+// Package script implements what users write in Starlark: the script module
+// of a configuration (see LoadModule), and the conditions of rules, which tell
+// the clients that rules apply to.
+package script
 
 // Condition is what a rule requires of clients: host patterns (see Hosts).
 type Condition interface {

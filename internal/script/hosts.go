@@ -1,4 +1,4 @@
-package condition
+package script
 
 import (
 	"errors"

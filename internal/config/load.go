@@ -25,6 +25,12 @@ const envPrefix = "FMS_"
 
 const envConfigFile = envPrefix + "CONFIG_FILE"
 
+// The variables of the script module, which hold one setting in two forms.
+const (
+	envScript     = envPrefix + "SCRIPT"
+	envScriptFile = envPrefix + "SCRIPT_FILE"
+)
+
 // Load reads the settings of the configuration file that FMS_CONFIG_FILE
 // points to, if set, then of the environment variables in environ (as
 // "NAME=value"), which override them, and checks them. Every mistake is
@@ -50,10 +56,18 @@ func Load(environ []string) (Config, error) {
 		s.resolvePaths(filepath.Dir(path))
 	}
 	s.addDefaultServer()
+	// Either variable replaces the script of the file, whichever form it has.
+	if env[envScript] != "" || env[envScriptFile] != "" {
+		s.Script, s.ScriptFile = "", ""
+	}
 	for _, v := range variables(&s, env) {
 		for _, err := range v.apply() {
 			errs = append(errs, fmt.Errorf("%s: %w", v.name, err))
 		}
+	}
+	if env[envScript] != "" && env[envScriptFile] != "" {
+		errs = append(errs, fmt.Errorf("%s: cannot be set together with %s", envScriptFile, envScript))
+		s.ScriptFile = "" // Reported once, here.
 	}
 
 	cfg, checkErrs := s.check()
