@@ -398,7 +398,7 @@ func TestFileErrors(t *testing.T) {
 		{"status not a mapping", "servers:\n  default: { status: Hello }\n", "line 2: must be a mapping, got `Hello`"},
 		{"server unknown option", "servers:\n  lobby: { kick: Bye, port: 25565 }\n", "line 2: unknown key port"},
 		{"rules not a list", "rules: { server: default }\n", "line 1: must be a list, got a mapping"},
-		{"rule unknown option", "rules: [{ server: default, when: x }]\n", "line 1: unknown key when"},
+		{"rule unknown option", "rules: [{ server: default, port: 25565 }]\n", "line 1: unknown key port"},
 		{"host as a single value", "rules: [{ host: a.example.com, server: default }]\n", "line 1: must be a list, got `a.examp...`"},
 		{"upstream unknown option", "upstreams:\n  lobby: { address: lobby.example.com, port: 25565 }\n", "line 2: unknown key port"},
 		{"invalid protocol version", "upstreams:\n  lobby:\n    address: lobby.example.com\n    handshake: { protocol: new }\n", "line 4: must be an integer, got `new`"},

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"slices"
 
@@ -34,13 +35,30 @@ type Rule struct {
 }
 
 // matches reports whether the client of sess matches all the conditions of r.
-func (r Rule) matches(sess *session) bool {
+// A condition that fails does not match, and its error is recorded in sess.
+// What conditions print is logged with r (see Server.scriptPrinter).
+func (s *Server) matches(r Rule, sess *session) bool {
+	if len(r.Conditions) == 0 {
+		return true
+	}
+	req := sess.scriptRequest()
+	req.Print = s.scriptPrinter(&sess.conn, slog.String("rule", r.Name))
 	for _, cond := range r.Conditions {
-		if !cond.Match(sess.conditionClient()) {
+		ok, err := cond.Match(req)
+		if err != nil {
+			sess.ruleErrors = append(sess.ruleErrors, ruleError{rule: r.Name, err: err})
+		}
+		if !ok {
 			return false
 		}
 	}
 	return true
+}
+
+// ruleError is the error of a rule whose condition failed.
+type ruleError struct {
+	rule string
+	err  error
 }
 
 // ClientProtocol is when to report the protocol version of each client in
@@ -100,7 +118,7 @@ func (s *Server) status(server VirtualServer) (*status.Status, statusSource) {
 // rule and the server in sess.
 func (s *Server) serverFor(sess *session) VirtualServer {
 	for _, rule := range s.cfg.Rules {
-		if rule.matches(sess) {
+		if s.matches(rule, sess) {
 			sess.rule, sess.server = rule.Name, rule.Server
 			return s.cfg.Servers[rule.Server]
 		}

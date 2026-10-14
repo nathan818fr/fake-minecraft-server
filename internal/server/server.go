@@ -109,10 +109,11 @@ type Server struct {
 	logger    *slog.Logger
 	upstreams map[string]Upstream
 
-	connLimiter   semaphore
-	clientLimiter *clientLimiter
-	rateLimiter   rateLimiter
-	logLimiter    logLimiter
+	connLimiter      semaphore
+	clientLimiter    *clientLimiter
+	rateLimiter      rateLimiter
+	logLimiter       logLimiter
+	ruleErrorLimiter ruleErrorLimiter
 }
 
 func New(cfg Config, logger *slog.Logger) (*Server, error) {
@@ -268,6 +269,19 @@ type session struct {
 	// client is what conditions know about the client, made when first
 	// needed (see conditionClient).
 	client *script.Client
+	// request is what scripts know about the request (see scriptRequest).
+	request script.Request
+	// ruleErrors are the errors of the conditions that failed.
+	ruleErrors []ruleError
+}
+
+// scriptRequest returns what scripts know about the request of sess, its
+// client made when first needed. Its Print is set by the caller of scripts.
+func (sess *session) scriptRequest() *script.Request {
+	if sess.request.Client == nil {
+		sess.request.Client = sess.conditionClient()
+	}
+	return &sess.request
 }
 
 // conditionClient returns what conditions know about the client of sess.
@@ -275,7 +289,27 @@ func (sess *session) conditionClient() *script.Client {
 	if sess.client != nil {
 		return sess.client
 	}
-	c := &script.Client{Host: sess.host()}
+	c := &script.Client{Request: script.RequestJoin, Host: sess.host(), Listener: sess.conn.listener.addr}
+	if remote := sess.conn.remote; !isUnixPeer(remote) {
+		c.IP = remote.Addr().WithZone("").String()
+	}
+	switch {
+	case sess.legacyPing != nil:
+		ping := sess.legacyPing
+		c.Request, c.Legacy, c.LegacyPingVersion = script.RequestPing, true, ping.Version.String()
+		c.Port, c.Protocol = int(ping.ServerPort), int(ping.ProtocolVersion)
+	case sess.legacyLogin != nil:
+		login := sess.legacyLogin
+		c.Legacy = true
+		c.Port, c.Protocol = int(login.ServerPort), int(login.ProtocolVersion)
+	default:
+		h := sess.handshake
+		if h.Intent == modernproto.IntentStatus {
+			c.Request = script.RequestPing
+		}
+		c.Transferred = h.Intent == modernproto.IntentTransfer
+		c.HostExtra, c.Port, c.Protocol = h.ServerAddressExtra, int(h.ServerPort), int(h.ProtocolVersion)
+	}
 	sess.client = c
 	return c
 }

@@ -561,6 +561,8 @@ func TestCheckErrors(t *testing.T) {
 		{"host with a space", "rules: [{ host: [\"a .com\"], server: default }]\n", `rules.0.host: invalid host "a .com": must not contain spaces or control characters`},
 		{"wildcard inside a host", "rules: [{ host: [\"a.*.com\"], server: default }]\n", `rules.0.host: invalid host "a.*.com": a wildcard is only allowed as "*." followed by a domain`},
 		{"wildcard alone", "rules: [{ host: [\"*\"], server: default }]\n", `rules.0.host: invalid host "*": a wildcard is only allowed as "*." followed by a domain`},
+		{"invalid condition", "rules: [{ when: 'client.protcol < 47', server: default }]\n", "rules.0.when: 1:8: client has no .protcol field or method (did you mean .protocol?)"},
+		{"condition failing with a sample", "rules: [{ when: client.host, server: default }]\n", `rules.0.when: fails for a modern ping (client.host "mc.example.com"): must return True or False, got string`},
 		{"wildcard without domain", "rules: [{ host: [\"*..a.com\"], server: default }]\n", `rules.0.host: invalid host "*..a.com": "*." must be followed by a domain`},
 		{"empty label in a host", "rules: [{ host: [a..com], server: default }]\n", `rules.0.host: invalid host "a..com": empty label`},
 		{"leading dot without domain", "rules: [{ host: [..a.com], server: default }]\n", `rules.0.host: invalid host "..a.com": "." must be followed by a domain`},
@@ -644,34 +646,90 @@ func hostConditions(t *testing.T, patterns ...string) []script.Condition {
 	return []script.Condition{hosts}
 }
 
-// The script module, in the configuration or in a file, runs at startup.
-func TestScript(t *testing.T) {
-	cfg, err := loadFile(t, "script: |\n  OFFICE = [\"10.0.0.0/8\"]\n  print(\"loaded\", len(OFFICE))\n", nil)
+// Conditions are Starlark expressions, which may span several lines.
+func TestRuleConditions(t *testing.T) {
+	cfg, err := loadFile(t, `
+rules:
+  - when: |
+      fms.in_network(client.ip, "10.0.0.0/8")
+        and client.protocol >= 767
+    server: default
+`, nil)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
-	if want := []string{"loaded 1"}; !slices.Equal(cfg.ScriptPrints, want) {
+	rules := cfg.Server.Rules
+	if len(rules) != 2 || len(rules[0].Conditions) != 1 || len(rules[1].Conditions) != 0 {
+		t.Fatalf("rules = %+v, want a condition, then the implicit last rule", rules)
+	}
+	for client, want := range map[*script.Client]bool{
+		{IP: "10.1.2.3", Protocol: 767}:  true,
+		{IP: "192.0.2.1", Protocol: 767}: false,
+		{IP: "10.1.2.3", Protocol: 47}:   false,
+	} {
+		if got, err := rules[0].Conditions[0].Match(&script.Request{Client: client}); err != nil || got != want {
+			t.Errorf("condition with %+v = %v, %v, want %v", client, got, err, want)
+		}
+	}
+
+	cfg, err = loadEnv(map[string]string{"FMS_RULES": `[{ when: 'client.request == "join"', server: default }]`})
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if got, err := cfg.Server.Rules[0].Conditions[0].Match(&script.Request{Client: &script.Client{Request: script.RequestJoin}}); err != nil || !got {
+		t.Errorf("condition of FMS_RULES = %v, %v, want a match", got, err)
+	}
+}
+
+// The script module, in the configuration or in a file, gives conditions its
+// functions and constants.
+func TestScript(t *testing.T) {
+	match := func(t *testing.T, cfg Config, client script.Client) bool {
+		t.Helper()
+		got, err := cfg.Server.Rules[0].Conditions[0].Match(&script.Request{Client: &client})
+		if err != nil {
+			t.Fatalf("Match() error: %v", err)
+		}
+		return got
+	}
+	staff := script.Client{IP: "10.1.2.3"}
+	inline := `
+script: |
+  STAFF = ["10.1.2.3"]
+  def is_staff(client):
+      return client.ip in STAFF
+  print("loaded")
+rules: [{ when: is_staff(client), server: default }]
+`
+	cfg, err := loadFile(t, inline, nil)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if !match(t, cfg, staff) || match(t, cfg, script.Client{IP: "192.0.2.1"}) {
+		t.Error("condition does not use the function of the script")
+	}
+	if want := []string{"loaded"}; !slices.Equal(cfg.ScriptPrints, want) {
 		t.Errorf("ScriptPrints = %q, want %q", cfg.ScriptPrints, want)
 	}
 
 	// A file next to the configuration file, or, in a variable, in the working
 	// directory, which replaces the script of the file.
-	path := writeConfigFile(t, "script_file: rules.star\n")
-	if err := os.WriteFile(filepath.Join(filepath.Dir(path), "rules.star"), []byte("print(\"file\")\n"), 0o600); err != nil {
+	path := writeConfigFile(t, "script_file: rules.star\nrules: [{ when: is_staff(client), server: default }]\n")
+	if err := os.WriteFile(filepath.Join(filepath.Dir(path), "rules.star"), []byte("def is_staff(client):\n    return True\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err = loadEnv(map[string]string{"FMS_CONFIG_FILE": path})
-	if err != nil || !slices.Equal(cfg.ScriptPrints, []string{"file"}) {
-		t.Errorf("Load() = %q, %v, want the script of the file next to the configuration", cfg.ScriptPrints, err)
+	if err != nil || !match(t, cfg, script.Client{}) {
+		t.Errorf("Load() error = %v, want the script of the file next to the configuration", err)
 	}
 	dir := t.TempDir()
 	t.Chdir(dir)
-	if err := os.WriteFile(filepath.Join(dir, "other.star"), []byte("print(\"variable\")\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "other.star"), []byte("def is_staff(client):\n    return False\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err = loadFile(t, "script: print(\"inline\")\n", map[string]string{"FMS_SCRIPT_FILE": "other.star"})
-	if err != nil || !slices.Equal(cfg.ScriptPrints, []string{"variable"}) {
-		t.Errorf("Load() = %q, %v, want the script of the variable", cfg.ScriptPrints, err)
+	cfg, err = loadFile(t, inline, map[string]string{"FMS_SCRIPT_FILE": "other.star"})
+	if err != nil || match(t, cfg, staff) {
+		t.Errorf("Load() error = %v, want the script of the variable", err)
 	}
 }
 
@@ -685,6 +743,7 @@ func TestScriptErrors(t *testing.T) {
 		{"both in the file", "script: X = 1\nscript_file: rules.star\n", nil, "script_file: cannot be set together with script"},
 		{"both in variables", "", map[string]string{"FMS_SCRIPT": "X = 1", "FMS_SCRIPT_FILE": "rules.star"}, "FMS_SCRIPT_FILE: cannot be set together with FMS_SCRIPT"},
 		{"invalid script", "script: |\n  X = 1\n  Y = X +\n", nil, "script: 2:8: got newline, want primary expression"},
+		{"unknown function", "rules: [{ when: is_staff(client), server: default }]\n", nil, "rules.0.when: 1:1: undefined: is_staff"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

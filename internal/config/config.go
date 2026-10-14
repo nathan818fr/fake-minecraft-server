@@ -107,8 +107,8 @@ type settings struct {
 	Rules     []ruleSettings              `yaml:"rules"`
 
 	// Script is the source of the script module, and ScriptFile the path of
-	// a file that holds it (see script.LoadModule). Only one of them can be
-	// set.
+	// a file that holds it, which conditions can use (see script.LoadModule).
+	// Only one of them can be set.
 	Script     string `yaml:"script"`
 	ScriptFile string `yaml:"script_file"`
 }
@@ -172,9 +172,11 @@ type handshakeSettings struct {
 }
 
 type ruleSettings struct {
-	Name   string   `yaml:"name"`
-	Host   []string `yaml:"host"`
-	Server string   `yaml:"server"`
+	Name string   `yaml:"name"`
+	Host []string `yaml:"host"`
+	// When is a Starlark expression (see script.Compile).
+	When   string `yaml:"when"`
+	Server string `yaml:"server"`
 }
 
 // addDefaultServer adds the default server to s, unless the configuration file
@@ -248,10 +250,11 @@ func (s *settings) check() (Config, []error) {
 	cfg.Server.Upstreams = c.upstreams(s.Upstreams)
 	cfg.Server.SoftwareSignature = !s.NoSoftwareSignature
 	cfg.Server.Servers = c.servers(s.Servers, s.Upstreams, cfg.Server.SoftwareSignature)
-	if module := c.module(s.Script, s.ScriptFile); module != nil {
+	module := c.module(s.Script, s.ScriptFile)
+	if module != nil {
 		cfg.ScriptPrints = module.Prints()
 	}
-	cfg.Server.Rules = c.rules(s.Rules, cfg.Server.Servers)
+	cfg.Server.Rules = c.rules(s.Rules, cfg.Server.Servers, module)
 	return cfg, c.errs
 }
 
@@ -572,7 +575,7 @@ func (c *checker) kick(key string, message any) json.RawMessage {
 // the default server, so that every client gets an answer. A rule without
 // conditions applies to every client, so the ones after it never apply, which
 // is an error.
-func (c *checker) rules(entries []ruleSettings, servers map[string]server.VirtualServer) []server.Rule {
+func (c *checker) rules(entries []ruleSettings, servers map[string]server.VirtualServer, module *script.Module) []server.Rule {
 	rules := make([]server.Rule, 0, len(entries)+1)
 	names := make(map[string]int, len(entries))
 	unconditional := -1 // The first rule without conditions, if any.
@@ -581,7 +584,7 @@ func (c *checker) rules(entries []ruleSettings, servers map[string]server.Virtua
 		rule := server.Rule{Name: strconv.Itoa(i), Server: entry.Server}
 		if unconditional >= 0 {
 			c.failf(key, "never applies: rule %d, before it, has no conditions", unconditional)
-		} else if entry.Host == nil {
+		} else if entry.Host == nil && entry.When == "" {
 			unconditional = i
 		}
 		if entry.Name != "" {
@@ -597,6 +600,13 @@ func (c *checker) rules(entries []ruleSettings, servers map[string]server.Virtua
 				c.fail(key+".host", err)
 			} else {
 				rule.Conditions = append(rule.Conditions, hosts)
+			}
+		}
+		if entry.When != "" {
+			if when, err := script.Compile(entry.When, module); err != nil {
+				c.fail(key+".when", err)
+			} else {
+				rule.Conditions = append(rule.Conditions, when)
 			}
 		}
 		if _, ok := servers[entry.Server]; !ok {
