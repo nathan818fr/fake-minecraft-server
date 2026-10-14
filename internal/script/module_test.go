@@ -4,18 +4,19 @@ import (
 	"slices"
 	"strconv"
 	"testing"
-
-	"go.starlark.net/starlark"
 )
 
-// A module runs once, with the dialect of scripts and the fms functions, and
-// keeps its globals frozen.
-func TestLoadModule(t *testing.T) {
+// Conditions use the functions and constants of the module, which runs once,
+// with the dialect of conditions.
+func TestModule(t *testing.T) {
 	m, err := LoadModule(`
-OFFICE = set(["10.0.0.0/8"])
+STAFF = set(["10.1.2.3"])
 PORTS = {}
 for port in [25565, 25566]:
     PORTS[port] = True
+
+def is_staff(client):
+    return client.ip in STAFF and fms.match_host(client.host, ".a.com")
 
 def countdown(n):
     while n > 0:
@@ -25,14 +26,6 @@ def countdown(n):
 def depth(n):
     return 0 if n == 0 else 1 + depth(n - 1)
 
-CHECKS = [
-    fms.in_network("10.1.2.3", *OFFICE),
-    fms.match_host("Play.A.com.", ".a.com"),
-    fms.matches("play1.a.com", "^play[0-9]+"),
-    not fms.in_network("", "10.0.0.0/8"),
-    countdown(3) == 0,
-    depth(3) == 3,
-]
 print("loaded", len(PORTS))
 `)
 	if err != nil {
@@ -41,14 +34,14 @@ print("loaded", len(PORTS))
 	if want := []string{"loaded 2"}; !slices.Equal(m.Prints(), want) {
 		t.Errorf("Prints() = %q, want %q", m.Prints(), want)
 	}
-	checks := m.globals["CHECKS"].(*starlark.List)
-	for i := range checks.Len() {
-		if checks.Index(i) != starlark.True {
-			t.Errorf("CHECKS[%d] = %s, want True", i, checks.Index(i))
-		}
+	c, err := Compile(`is_staff(client) and client.port in PORTS and countdown(3) == 0 and depth(3) == 3`, m)
+	if err != nil {
+		t.Fatalf("Compile() error: %v", err)
 	}
-	if err := m.globals["PORTS"].(*starlark.Dict).SetKey(starlark.MakeInt(1), starlark.True); err == nil {
-		t.Error("PORTS can be changed, want it frozen")
+	for client, want := range map[*Client]bool{&modernJoin: true, &legacyPing: false} {
+		if got, err := c.Match(&Request{Client: client}); err != nil || got != want {
+			t.Errorf("Match(%+v) = %v, %v, want %v", client, got, err, want)
+		}
 	}
 }
 
@@ -59,14 +52,12 @@ func TestLoadModuleErrors(t *testing.T) {
 	}{
 		{"x = 1\nx = 2\n", "2:1: cannot reassign global x declared at 1:1"},
 		{"load(\"other.star\", \"x\")\n", "1:1: load is not supported: a configuration has a single script"},
+		{"client = 1\n", "1:1: client is reserved for the variable that scripts see"},
 		{"def fms():\n    pass\n", "1:5: fms is reserved for the variable that scripts see"},
-		{"for fms in []:\n    pass\n", "1:5: fms is reserved for the variable that scripts see"},
-		{"X = fms.matches(\"a\", \"(\")\n", "1:22: fms.matches: error parsing regexp: missing closing ): `(`"},
-		{"X = fms.in_network(\"10.0.0.1\", \"10.0.0.0/33\")\n", `1:32: fms.in_network: "10.0.0.0/33" is not an IP address or CIDR prefix`},
-		{"X = fms.match_host(\"a.com\", \"a.*.com\")\n", `1:29: fms.match_host: invalid host "a.*.com": a wildcard is only allowed as "*." followed by a domain`},
+		{"def f(client):\n    return client.protcol\n", "2:19: client has no .protcol field or method (did you mean .protocol?)"},
+		{"def f(client):\n    return fms.matches(client.host, \"(\")\n", "2:37: fms.matches: error parsing regexp: missing closing ): `(`"},
 		{"X = [1][2]\n", "1:8: list index 2 out of range [-1:0]"},
 		{"def f():\n    return 1 // 0\nX = f()\n", "2:14: floored division by zero"},
-		{"X = fms.in_network(\"x\", \"10.0.0.0/8\")\n", "1:19: fms.in_network: ParseAddr(\"x\"): unable to parse IP"},
 		{"X = len([x for x in range(2000000)])\n", "1:10: Starlark computation cancelled: too many steps"},
 		{"X = (\n", "2:1: got end of file, want primary expression"},
 	}
@@ -77,14 +68,35 @@ func TestLoadModuleErrors(t *testing.T) {
 	}
 }
 
-// The top level of a module can take many steps, to build tables.
+// The top level of a module has a larger budget than each evaluation.
 func TestLoadModuleSteps(t *testing.T) {
-	m, err := LoadModule("TABLE = {i: i * i for i in range(20000)}\n")
+	m, err := LoadModule("TABLE = {i: i * i for i in range(20000)}\ndef square(n):\n    return TABLE[n]\n")
 	if err != nil {
 		t.Fatalf("LoadModule() error: %v", err)
 	}
-	if n := m.globals["TABLE"].(*starlark.Dict).Len(); n != 20000 {
-		t.Errorf("TABLE has %d entries, want 20000", n)
+	if _, err := Compile(`square(client.port % 1000) >= 0`, m); err != nil {
+		t.Errorf("Compile() error: %v", err)
+	}
+}
+
+// What conditions print during a request goes to its Print, and nowhere when
+// checked with sample clients.
+func TestRequestPrint(t *testing.T) {
+	m, err := LoadModule("def log(client):\n    print(\"from\", client.ip)\n    return True\n")
+	if err != nil {
+		t.Fatalf("LoadModule() error: %v", err)
+	}
+	c, err := Compile(`log(client)`, m)
+	if err != nil {
+		t.Fatalf("Compile() error: %v", err)
+	}
+	var printed []string
+	req := &Request{Client: &modernJoin, Print: func(msg string) { printed = append(printed, msg) }}
+	if got, err := c.Match(req); err != nil || !got {
+		t.Errorf("Match() = %v, %v, want true", got, err)
+	}
+	if want := []string{"from 10.1.2.3"}; !slices.Equal(printed, want) {
+		t.Errorf("printed %q, want %q", printed, want)
 	}
 }
 

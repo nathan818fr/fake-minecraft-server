@@ -15,24 +15,27 @@ const maxLoadSteps = 1_000_000
 
 // reservedNames are the names of the variables that scripts see, which modules
 // must not define, so that they never hide them.
-var reservedNames = []string{"fms"}
+var reservedNames = []string{"client", "fms"}
 
-// Module is the script of a configuration: functions and constants written in
-// Starlark. Its globals are frozen, so that they can be shared.
+// Module is the script of a configuration: the functions and constants that
+// conditions can use. Its globals are frozen, so that requests share them.
 type Module struct {
 	globals starlark.StringDict
 	prints  []string
 }
 
 // LoadModule runs src, a Starlark file, once, and returns its globals. It
-// checks the literal arguments of the functions, and reports the mistakes of
-// src with their positions in it.
+// checks, like Compile, the fields of client and the literal arguments of the
+// functions, and reports the mistakes of src with their positions in it.
 func LoadModule(src string) (*Module, error) {
 	file, err := dialect.Parse("", src, 0)
 	if err != nil {
 		return nil, positioned(err, 0)
 	}
 	if err := checkModuleStmts(file); err != nil {
+		return nil, err
+	}
+	if err := checkFields(file, 0); err != nil {
 		return nil, err
 	}
 	if err := checkLiterals(file, 0); err != nil {
