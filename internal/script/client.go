@@ -1,88 +1,82 @@
 package script
 
 import (
-	"fmt"
-	"slices"
-	"strings"
-
 	"go.starlark.net/starlark"
 )
 
-// clientFields are the fields of the client variable, named like the fields
-// of logs, in the order of their bits in clientValue.read. Their values are
-// strings, ints or bools (see Field).
-var clientFields = []struct {
-	name  string
-	value func(c *Client) starlark.Value
-}{
-	{"request", func(c *Client) starlark.Value { return starlark.String(c.Request) }},
-	{"transferred", func(c *Client) starlark.Value { return starlark.Bool(c.Transferred) }},
-	{"host", func(c *Client) starlark.Value { return starlark.String(c.Host) }},
-	{"host_extra", func(c *Client) starlark.Value { return starlark.String(c.HostExtra) }},
-	{"port", func(c *Client) starlark.Value { return starlark.MakeInt(c.Port) }},
-	{"protocol", func(c *Client) starlark.Value { return starlark.MakeInt(c.Protocol) }},
-	{"legacy", func(c *Client) starlark.Value { return starlark.Bool(c.Legacy) }},
-	{"legacy_ping_version", func(c *Client) starlark.Value { return starlark.String(c.LegacyPingVersion) }},
-	{"ip", func(c *Client) starlark.Value { return starlark.String(c.IP) }},
-	{"listener", func(c *Client) starlark.Value { return starlark.String(c.Listener) }},
+// The requests of Client.Request.
+const (
+	RequestPing = "ping"
+	RequestJoin = "join"
+)
+
+// Client is what scripts know about a client, as the fields of their client
+// variable, named like the fields of logs (see clientKind). Unknown values are
+// empty or zero, and -1 for Protocol.
+type Client struct {
+	// Request is RequestPing for status requests, and RequestJoin for logins
+	// and transfers.
+	Request     string
+	Transferred bool
+	// Host is the host that the client connected to, as it sent it, and
+	// HostExtra what modded clients and proxies add after it.
+	Host      string
+	HostExtra string
+	Port      int
+	Protocol  int
+	Legacy    bool
+	// LegacyPingVersion is the format of legacy pings, such as "1.6".
+	LegacyPingVersion string
+	// IP is the address of the client, empty for Unix socket clients.
+	IP       string
+	Listener string
+	// Username and UUID are what the client sent when joining, UUID formatted
+	// like "069a79f4-44e9-4726-a5be-fca90e38aaf5" (1.19.3+), or empty.
+	Username string
+	UUID     string
 }
 
-// fieldNames are the names of clientFields.
-var fieldNames = func() []string {
-	names := make([]string, len(clientFields))
-	for i, f := range clientFields {
-		names[i] = f.name
-	}
-	return names
-}()
-
-// clientValue is the client variable of conditions: a read-only view of a
-// Client, which records the fields read, even by functions it is passed to, to
-// tell which values a condition failed with.
-type clientValue struct {
-	c    *Client
-	read uint32 // A bit for each of clientFields.
+// Field is a field of the client variable of scripts and its value: a string,
+// an int or a bool.
+type Field struct {
+	Name  string
+	Value any
 }
 
-var _ starlark.HasAttrs = (*clientValue)(nil)
-
-func (v *clientValue) String() string {
-	var b strings.Builder
-	b.WriteString("client(")
-	for i, f := range clientFields {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString(f.name + " = " + f.value(v.c).String())
-	}
-	b.WriteString(")")
-	return b.String()
+// String returns f as in scripts, such as `client.host "mc.example.com"`.
+func (f Field) String() string {
+	return "client." + f.Name + " " + starlarkValue(f.Value).String()
 }
 
-func (v *clientValue) Type() string         { return "client" }
-func (v *clientValue) Freeze()              {}
-func (v *clientValue) Truth() starlark.Bool { return true }
+// clientValue is the client variable of scripts: a view of a Client, which
+// records the fields read, even by the functions it is passed to, to tell
+// which values a script failed with (see clientFields).
+type clientValue = object[*Client]
 
-func (v *clientValue) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable: %s", v.Type()) }
+// clientKind is the kind of clientValue: its fields, named like the fields of
+// logs, are strings, ints or bools (see Field).
+var clientKind = newObjectKind("client", nil, []objectAttr[*Client]{
+	{name: "request", field: func(c *Client) starlark.Value { return starlark.String(c.Request) }},
+	{name: "transferred", field: func(c *Client) starlark.Value { return starlark.Bool(c.Transferred) }},
+	{name: "host", field: func(c *Client) starlark.Value { return starlark.String(c.Host) }},
+	{name: "host_extra", field: func(c *Client) starlark.Value { return starlark.String(c.HostExtra) }},
+	{name: "port", field: func(c *Client) starlark.Value { return starlark.MakeInt(c.Port) }},
+	{name: "protocol", field: func(c *Client) starlark.Value { return starlark.MakeInt(c.Protocol) }},
+	{name: "legacy", field: func(c *Client) starlark.Value { return starlark.Bool(c.Legacy) }},
+	{name: "legacy_ping_version", field: func(c *Client) starlark.Value { return starlark.String(c.LegacyPingVersion) }},
+	{name: "ip", field: func(c *Client) starlark.Value { return starlark.String(c.IP) }},
+	{name: "listener", field: func(c *Client) starlark.Value { return starlark.String(c.Listener) }},
+	{name: "username", field: func(c *Client) starlark.Value { return starlark.String(c.Username) }},
+	{name: "uuid", field: func(c *Client) starlark.Value { return starlark.String(c.UUID) }},
+})
 
-func (v *clientValue) Attr(name string) (starlark.Value, error) {
-	i := slices.Index(fieldNames, name)
-	if i < 0 {
-		return nil, nil // Starlark reports it, with a spelling hint.
-	}
-	v.read |= 1 << i
-	return clientFields[i].value(v.c), nil
-}
-
-// AttrNames returns a copy, which callers may sort, as dir does.
-func (v *clientValue) AttrNames() []string { return slices.Clone(fieldNames) }
-
-// fields returns the fields read, in the order of clientFields.
-func (v *clientValue) fields() []Field {
+// clientFields returns the fields of v that scripts read, in the order of
+// clientKind.
+func clientFields(v *clientValue) []Field {
 	var fields []Field
-	for i, f := range clientFields {
+	for i, a := range v.kind.attrs {
 		if v.read&(1<<i) != 0 {
-			fields = append(fields, Field{Name: f.name, Value: goValue(f.value(v.c))})
+			fields = append(fields, Field{Name: a.name, Value: goValue(a.field(v.state))})
 		}
 	}
 	return fields
@@ -99,7 +93,7 @@ func goValue(v starlark.Value) any {
 		n, _ := v.Int64() // Ports and protocol versions fit.
 		return int(n)
 	}
-	panic("condition: unsupported value") // See Field.
+	panic("script: unsupported value") // See Field.
 }
 
 // starlarkValue returns value, the value of a field, as a Starlark value.
@@ -112,5 +106,5 @@ func starlarkValue(value any) starlark.Value {
 	case bool:
 		return starlark.Bool(value)
 	}
-	panic("condition: unsupported value") // See Field.
+	panic("script: unsupported value") // See Field.
 }

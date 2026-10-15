@@ -13,6 +13,7 @@ import (
 
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/logging"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/server"
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/status"
 )
 
 // Every setting has a variable named after its key, and every upstream and
@@ -111,7 +112,7 @@ func TestVariableValues(t *testing.T) {
 	}; !reflect.DeepEqual(cfg.Server.Rules, want) {
 		t.Errorf("Rules = %v, want %v", cfg.Server.Rules, want)
 	}
-	if vs := cfg.Server.Servers["maintenance"]; vs.ClientProtocol != server.ClientProtocolNever || string(vs.Kick) != `{"text":"Closed"}` {
+	if vs := cfg.Server.Servers["maintenance"]; vs.ClientProtocol != status.ClientProtocolNever || string(vs.Kick) != `{"text":"Closed"}` {
 		t.Errorf("maintenance server = %+v, want its client protocol and kick message", vs)
 	}
 	// The lobby server, without a kick message, gets the built-in one, never
@@ -209,7 +210,7 @@ rules: [{ server: lobby }, { server: default }]
 	}
 	// The options of a server replace the ones of the file, and the others
 	// are kept.
-	if vs := cfg.Server.Servers["default"]; vs.ClientProtocol != server.ClientProtocolAlways {
+	if vs := cfg.Server.Servers["default"]; vs.ClientProtocol != status.ClientProtocolAlways {
 		t.Errorf("default server = %+v, want the client protocol of the variable", vs)
 	}
 	if vs := cfg.Server.Servers["lobby"]; string(vs.Kick) != `{"text":"Lobby down"}` {

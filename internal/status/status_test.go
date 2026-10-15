@@ -55,6 +55,25 @@ func TestParse(t *testing.T) {
 	}
 }
 
+// New encodes a favicon, unless it already is, so that callers can pass an
+// encoded one on without encoding it again.
+func TestNew(t *testing.T) {
+	encoded := json.RawMessage(`"data:image/png;base64,AAAA"`)
+	for _, favicon := range []any{"data:image/png;base64,AAAA", encoded} {
+		s, err := New(Object{{"favicon", favicon}})
+		if err != nil {
+			t.Fatalf("New() error: %v", err)
+		}
+		got, _ := s.Get(faviconPath)
+		if data, ok := got.(json.RawMessage); !ok || string(data) != string(encoded) {
+			t.Errorf("New(%#v) favicon = %#v, want %s", favicon, got, encoded)
+		}
+		if _, ok := favicon.(json.RawMessage); ok && &got.(json.RawMessage)[0] != &encoded[0] {
+			t.Errorf("New() encoded the favicon again")
+		}
+	}
+}
+
 func TestParseWithoutKnownFields(t *testing.T) {
 	s := mustParse(t, `{"custom":1}`)
 	if s.Version() != (Version{}) || s.Players() != (Players{}) || s.Description() != nil {

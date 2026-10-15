@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"maps"
 	"net/netip"
@@ -16,6 +17,7 @@ import (
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/logging"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/script"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/server"
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/status"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/upstream"
 )
 
@@ -69,7 +71,7 @@ func TestDefaults(t *testing.T) {
 	if got := statusJSON(t, cfg, "default"); len(cfg.Server.Servers) != 1 || got != defaultStatus {
 		t.Errorf("servers = %v, default status = %s, want only %s", cfg.Server.Servers, got, defaultStatus)
 	}
-	if vs := cfg.Server.Servers["default"]; string(vs.Kick) != `{"text":"§cNot available"}` || vs.ClientProtocol != server.ClientProtocolAuto {
+	if vs := cfg.Server.Servers["default"]; string(vs.Kick) != `{"text":"§cNot available"}` || vs.ClientProtocol != status.ClientProtocolAuto {
 		t.Errorf("default server = %+v, want the built-in kick message and the client protocol by default", vs)
 	}
 	if want := []server.Rule{{Name: "default", Server: "default"}}; len(cfg.Server.Upstreams) != 0 || !reflect.DeepEqual(cfg.Server.Rules, want) {
@@ -174,7 +176,7 @@ rules:
 	}; !reflect.DeepEqual(s.Rules, want) {
 		t.Errorf("Rules = %v, want %v", s.Rules, want)
 	}
-	if vs := s.Servers["maintenance"]; vs.ClientProtocol != server.ClientProtocolNever || string(vs.Kick) != `{"color":"red","text":"Maintenance"}` {
+	if vs := s.Servers["maintenance"]; vs.ClientProtocol != status.ClientProtocolNever || string(vs.Kick) != `{"color":"red","text":"Maintenance"}` {
 		t.Errorf("maintenance server = %+v, want its client protocol and kick message", vs)
 	}
 	// Servers without a kick message get the built-in one, never the one of
@@ -533,6 +535,7 @@ func TestCheckErrors(t *testing.T) {
 			`servers.lobby.status.description: invalid JSON at byte 13: unexpected end of JSON input` +
 				` (for plain text that starts with "{", write { text: "..." })`,
 		},
+		{"duplicate key in a kick message", "servers:\n  lobby: { kick: '{\"text\": \"a\", \"text\": \"b\"}' }\n", `servers.lobby.kick: duplicate field "text"`},
 		{"unsupported kick message", "servers:\n  default: { kick: [{ text: .inf }] }\n", "servers.default.kick: json: unsupported value: +Inf"},
 		{
 			"invalid protocol version", "servers:\n  default:\n    status: { version: { protocol: \"1.21\" } }\n",
@@ -667,7 +670,7 @@ rules:
 		{IP: "192.0.2.1", Protocol: 767}: false,
 		{IP: "10.1.2.3", Protocol: 47}:   false,
 	} {
-		if got, err := rules[0].Conditions[0].Match(&script.Request{Client: client}); err != nil || got != want {
+		if got, err := rules[0].Conditions[0].Match(&script.Request{Client: client}, nil); err != nil || got != want {
 			t.Errorf("condition with %+v = %v, %v, want %v", client, got, err, want)
 		}
 	}
@@ -676,7 +679,7 @@ rules:
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
-	if got, err := cfg.Server.Rules[0].Conditions[0].Match(&script.Request{Client: &script.Client{Request: script.RequestJoin}}); err != nil || !got {
+	if got, err := cfg.Server.Rules[0].Conditions[0].Match(&script.Request{Client: &script.Client{Request: script.RequestJoin}}, nil); err != nil || !got {
 		t.Errorf("condition of FMS_RULES = %v, %v, want a match", got, err)
 	}
 }
@@ -686,7 +689,7 @@ rules:
 func TestScript(t *testing.T) {
 	match := func(t *testing.T, cfg Config, client script.Client) bool {
 		t.Helper()
-		got, err := cfg.Server.Rules[0].Conditions[0].Match(&script.Request{Client: &client})
+		got, err := cfg.Server.Rules[0].Conditions[0].Match(&script.Request{Client: &client}, nil)
 		if err != nil {
 			t.Fatalf("Match() error: %v", err)
 		}
@@ -756,5 +759,70 @@ func TestScriptErrors(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.star")
 	if _, err := loadEnv(map[string]string{"FMS_SCRIPT_FILE": path}); err == nil || !strings.HasPrefix(err.Error(), "script_file: open "+path) {
 		t.Errorf("Load() error = %v, want the file that cannot be read", err)
+	}
+}
+
+// Servers can answer with hooks, which see the client, the server, the
+// upstreams and the other servers, and whose results are checked like the
+// rest of the configuration.
+func TestHooks(t *testing.T) {
+	cfg, err := loadFile(t, `
+upstreams:
+  survival: { address: survival.example.com }
+servers:
+  survival:
+    status: { description: Down }
+    ping_script: '{"status": fms.merge(server.status, {"description": "Hello " + client.host})}'
+    join_script: '{"kick": ctx.server("lobby").kick} if ctx.upstream("survival").status == None else None'
+  lobby:
+    kick: Lobby
+`, map[string]string{"FMS_SERVERS_LOBBY": `{ join_script: '{"kick": "Bye " + client.username}' }`})
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	survival := cfg.Server.Servers["survival"]
+	answer, err := survival.PingHook.Run(&script.Request{Client: &script.Client{Host: "a.com"}}, nil)
+	if err != nil || string(answer.Status.AppendJSON(nil)) != `{"description":"Hello a.com"}` {
+		t.Errorf("ping script = %+v, %v, want the merged status", answer, err)
+	}
+	if kick, err := survival.JoinHook.Run(&script.Request{Client: &script.Client{}}, nil); err != nil || string(kick) != `{"text":"Lobby"}` {
+		t.Errorf("join script = %s, %v, want the kick of the lobby server", kick, err)
+	}
+	if kick, err := cfg.Server.Servers["lobby"].JoinHook.Run(&script.Request{Client: &script.Client{Username: "Notch"}}, nil); err != nil || string(kick) != `{"text":"Bye Notch"}` {
+		t.Errorf("join script of the variable = %s, %v, want its kick", kick, err)
+	}
+}
+
+func TestHookErrors(t *testing.T) {
+	tests := []struct {
+		name, content, want string
+	}{
+		{"invalid result", "servers:\n  lobby: { join_script: '\"Bye\"' }\n", `servers.lobby.join_script: fails for a player joining: must return None or {"kick": message}, got string`},
+		{"unknown upstream", "servers:\n  lobby: { join_script: 'ctx.upstream(\"lobby\")' }\n", `servers.lobby.join_script: 1:14: ctx.upstream: no upstream has the ID "lobby"`},
+		{
+			"too long a status", "servers:\n  lobby: { ping_script: '{\"status\": {\"description\": \"a\" * 40000}}' }\n",
+			`servers.lobby.ping_script: fails for a modern ping: "status": too long: 40090 characters, the limit is 32767 (is the favicon too large?)`,
+		},
+		{"function of the script", "script: 'def f(client):\n  return None'\nservers:\n  lobby: { join_script: f(client) }\n", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := loadFile(t, tc.content, nil)
+			if got := fmt.Sprint(err); (tc.want == "" && err != nil) || (tc.want != "" && got != tc.want) {
+				t.Errorf("Load() error = %v, want %s", err, tc.want)
+			}
+		})
+	}
+}
+
+// What a script printed before failing is kept, for main to log it with the
+// errors.
+func TestScriptPrintsOnFailure(t *testing.T) {
+	cfg, err := loadFile(t, "script: |\n  print(\"loading\")\n  X = 1 // 0\n", nil)
+	if err == nil {
+		t.Fatal("Load() succeeded, want the error of the script")
+	}
+	if want := []string{"loading"}; !slices.Equal(cfg.ScriptPrints, want) {
+		t.Errorf("ScriptPrints = %q, want %q", cfg.ScriptPrints, want)
 	}
 }

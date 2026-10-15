@@ -25,7 +25,7 @@ func Hosts(patterns []string) (Condition, error) {
 	return c, nil
 }
 
-func (c hosts) Match(req *Request) (bool, error) {
+func (c hosts) Match(req *Request, _ func(msg string)) (bool, error) {
 	return matchHost(c, req.Client.Host), nil
 }
 

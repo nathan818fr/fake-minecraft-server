@@ -19,10 +19,15 @@ type VirtualServer struct {
 	Status *status.Status
 	// Upstream is the ID of the upstream giving the live status, if any.
 	Upstream       string
-	ClientProtocol ClientProtocol
+	ClientProtocol status.ClientProtocol
 	// Kick is the message sent to players who try to join, a JSON text
 	// component.
 	Kick json.RawMessage
+	// PingHook and JoinHook, its ping_script and join_script if set, can
+	// answer status requests and joins in place of the status and the kick
+	// message.
+	PingHook *script.PingHook
+	JoinHook *script.JoinHook
 }
 
 // Rule tells which virtual server clients see. The rules are tried in order,
@@ -41,10 +46,10 @@ func (s *Server) matches(r Rule, sess *session) bool {
 	if len(r.Conditions) == 0 {
 		return true
 	}
-	req := sess.scriptRequest()
-	req.Print = s.scriptPrinter(&sess.conn, slog.String("rule", r.Name))
+	req := s.scriptRequest(sess)
+	printer := s.scriptPrinter(&sess.conn, slog.String("rule", r.Name))
 	for _, cond := range r.Conditions {
-		ok, err := cond.Match(req)
+		ok, err := cond.Match(req, printer)
 		if err != nil {
 			sess.ruleErrors = append(sess.ruleErrors, ruleError{rule: r.Name, err: err})
 		}
@@ -61,54 +66,20 @@ type ruleError struct {
 	err  error
 }
 
-// ClientProtocol is when to report the protocol version of each client in
-// place of the one of the status, so that clients see the server as
-// compatible.
-type ClientProtocol int
+// answerSource is where the answer to a client came from, as logged.
+type answerSource string
 
 const (
-	// ClientProtocolAuto keeps the protocol versions that no client has (see
-	// firstClientProtocolVersion).
-	ClientProtocolAuto ClientProtocol = iota
-	ClientProtocolAlways
-	ClientProtocolNever
+	sourceStatic   answerSource = "static"
+	sourceUpstream answerSource = "upstream"
+	sourceScript   answerSource = "script"
 )
 
-// firstClientProtocolVersion is the protocol version of 1.7.2, the first
-// release with the modern protocol. Lower ones make clients show the status as
-// incompatible, with its version name in place of the player counts: a common
-// way to show a message such as "§cMaintenance", with -1 or 1 in plugins.
-const firstClientProtocolVersion = 4
-
-// replaces reports whether the protocol version of st is replaced by the one
-// of each client.
-func (c ClientProtocol) replaces(st *status.Status) bool {
-	switch c {
-	case ClientProtocolAlways:
-		return true
-	case ClientProtocolNever:
-		return false
-	default:
-		protocolVersion, ok := st.ProtocolVersion()
-		return !ok || protocolVersion >= firstClientProtocolVersion
-	}
-}
-
-// statusSource is where the status answered to a client came from, as logged.
-type statusSource string
-
-const (
-	sourceStatic   statusSource = "static"
-	sourceUpstream statusSource = "upstream"
-)
-
-// status returns the status of server right now: the one of its upstream while
-// it has one, or else its static one.
-func (s *Server) status(server VirtualServer) (*status.Status, statusSource) {
-	if upstream, ok := s.upstreams[server.Upstream]; ok {
-		if st := upstream.Status(); st != nil {
-			return st, sourceUpstream
-		}
+// status returns the status of server for the request of sess: the one of its
+// upstream while it has one, or else its static one.
+func (s *Server) status(sess *session, server VirtualServer) (*status.Status, answerSource) {
+	if st := s.upstreamState(sess, server.Upstream).Status; st != nil {
+		return st, sourceUpstream
 	}
 	return server.Status, sourceStatic
 }
@@ -126,17 +97,60 @@ func (s *Server) serverFor(sess *session) VirtualServer {
 	panic("no rule applies") // The last rule always applies (see checkServers).
 }
 
-// statusFor returns the status to answer to the client of sess, the one of its
-// server right now (see serverFor), with the protocol version of the client if
-// the server reports it. It records where the status came from in sess.
+// statusFor returns the status to answer to the client of sess: the one of its
+// server (see serverFor), from its ping hook, or else from its upstream or
+// static status, with the protocol version of the client if the server
+// reports it. It records where the status came from in sess.
 func (s *Server) statusFor(sess *session) *status.Status {
 	server := s.serverFor(sess)
-	st, source := s.status(server)
-	sess.statusSource = source
-	if protocolVersion, ok := clientProtocolVersion(sess); ok && server.ClientProtocol.replaces(st) {
+	st, source := s.status(sess, server)
+	clientProtocol := server.ClientProtocol
+	if server.PingHook != nil {
+		answer, err := server.PingHook.Run(s.scriptRequest(sess), s.hookPrinter(sess, "ping_script"))
+		switch {
+		case err != nil:
+			sess.hookErrors = append(sess.hookErrors, hookError{hook: "ping_script", server: sess.server, err: err})
+		case answer != nil:
+			st, source, clientProtocol = answer.Status, sourceScript, answer.ClientProtocol
+		}
+	}
+	sess.source = source
+	if protocolVersion, ok := clientProtocolVersion(sess); ok && clientProtocol.Replaces(st) {
 		st = st.WithProtocolVersion(protocolVersion)
 	}
 	return st
+}
+
+// kickFor returns the kick message to answer to the client of sess: the one of
+// its server (see serverFor), from its join hook, or else its own. It records
+// where it came from in sess, if from the hook.
+func (s *Server) kickFor(sess *session) json.RawMessage {
+	server := s.serverFor(sess)
+	if server.JoinHook != nil {
+		kick, err := server.JoinHook.Run(s.scriptRequest(sess), s.hookPrinter(sess, "join_script"))
+		switch {
+		case err != nil:
+			sess.hookErrors = append(sess.hookErrors, hookError{hook: "join_script", server: sess.server, err: err})
+		case kick != nil:
+			sess.source = sourceScript
+			return kick
+		}
+	}
+	return server.Kick
+}
+
+// hookPrinter returns the function that logs what the hook named hook of the
+// server of sess prints, with them.
+func (s *Server) hookPrinter(sess *session, hook string) func(msg string) {
+	return s.scriptPrinter(&sess.conn, slog.String("server", sess.server), slog.String("hook", hook))
+}
+
+// hookError is the error of a hook that failed, which the server answered
+// without.
+type hookError struct {
+	hook   string
+	server string
+	err    error
 }
 
 // checkServers checks the virtual servers, which must all have a static status

@@ -54,8 +54,9 @@ type resolver interface {
 }
 
 type received struct {
-	status *status.Status
-	at     time.Time
+	status  *status.Status
+	at      time.Time
+	latency time.Duration
 }
 
 // NewPoller returns a poller for the upstream identified by id in logs.
@@ -64,21 +65,41 @@ func NewPoller(id string, cfg Config, logger *slog.Logger) *Poller {
 }
 
 func newPoller(id string, cfg Config, logger *slog.Logger, r resolver) *Poller {
-	address := cfg.Host
-	if cfg.Port != 0 {
-		address = net.JoinHostPort(cfg.Host, strconv.Itoa(int(cfg.Port)))
-	}
-	return &Poller{cfg: cfg, logger: logger.With("upstream", id, "address", address), resolver: r}
+	return &Poller{cfg: cfg, logger: logger.With("upstream", id, "address", cfg.Address()), resolver: r}
 }
 
-// Status returns the last status received, or nil if none was received within
-// MaxAge.
-func (p *Poller) Status() *status.Status {
-	r := p.latest.Load()
-	if r == nil || time.Since(r.at) > p.cfg.MaxAge {
-		return nil
+// Address returns the address of the server as configured: host, or
+// host:port.
+func (cfg Config) Address() string {
+	if cfg.Port == 0 {
+		return cfg.Host
 	}
-	return r.status
+	return net.JoinHostPort(cfg.Host, strconv.Itoa(int(cfg.Port)))
+}
+
+// State is what is known of a server at a time.
+type State struct {
+	// Status is the last status received, or nil if none was received within
+	// MaxAge.
+	Status *status.Status
+	// Polled reports whether a poll succeeded, the last one of which had a
+	// ping of Latency, Age ago.
+	Polled  bool
+	Latency time.Duration
+	Age     time.Duration
+}
+
+func (p *Poller) State() State {
+	r := p.latest.Load()
+	if r == nil {
+		return State{}
+	}
+	age := time.Since(r.at)
+	st := State{Polled: true, Latency: r.latency, Age: age}
+	if age <= p.cfg.MaxAge {
+		st.Status = r.status
+	}
+	return st
 }
 
 // availability is the state of a server, as last logged.
@@ -91,8 +112,8 @@ const (
 )
 
 // Run polls the server until ctx is canceled. It logs when the server becomes
-// available, and when it becomes unavailable: when Status starts returning
-// nil. The other polls are logged at the debug level.
+// available, and when it becomes unavailable: when the status of State
+// becomes nil. The other polls are logged at the debug level.
 func (p *Poller) Run(ctx context.Context) {
 	state := unknown
 	for {
@@ -103,7 +124,7 @@ func (p *Poller) Run(ctx context.Context) {
 
 		wait := p.cfg.Interval
 		if err == nil {
-			p.latest.Store(&received{status: st, at: time.Now()})
+			p.latest.Store(&received{status: st, at: time.Now(), latency: latency})
 			if state != available {
 				p.logStatus(slog.LevelInfo, "upstream available", st, latency)
 				state = available
@@ -112,7 +133,7 @@ func (p *Poller) Run(ctx context.Context) {
 			}
 		} else {
 			wait = p.cfg.RetryInterval
-			if state != unavailable && p.Status() == nil {
+			if state != unavailable && p.State().Status == nil {
 				p.logger.Warn("upstream unavailable", logging.Error(err))
 				state = unavailable
 			} else {

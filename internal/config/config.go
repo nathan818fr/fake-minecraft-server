@@ -107,8 +107,8 @@ type settings struct {
 	Rules     []ruleSettings              `yaml:"rules"`
 
 	// Script is the source of the script module, and ScriptFile the path of
-	// a file that holds it, which conditions can use (see script.LoadModule).
-	// Only one of them can be set.
+	// a file that holds it, which conditions and hooks can use (see
+	// script.Scope.LoadModule). Only one of them can be set.
 	Script     string `yaml:"script"`
 	ScriptFile string `yaml:"script_file"`
 }
@@ -152,6 +152,10 @@ type serverSettings struct {
 	// Kick is plain text, or a JSON text component written in YAML or in
 	// JSON.
 	Kick any `yaml:"kick"`
+	// PingScript and JoinScript are Starlark expressions (see
+	// script.Scope.CompilePingHook and script.Scope.CompileJoinHook).
+	PingScript string `yaml:"ping_script"`
+	JoinScript string `yaml:"join_script"`
 }
 
 type upstreamSettings struct {
@@ -174,7 +178,7 @@ type handshakeSettings struct {
 type ruleSettings struct {
 	Name string   `yaml:"name"`
 	Host []string `yaml:"host"`
-	// When is a Starlark expression (see script.Compile).
+	// When is a Starlark expression (see script.Scope.CompileCondition).
 	When   string `yaml:"when"`
 	Server string `yaml:"server"`
 }
@@ -250,12 +254,59 @@ func (s *settings) check() (Config, []error) {
 	cfg.Server.Upstreams = c.upstreams(s.Upstreams)
 	cfg.Server.SoftwareSignature = !s.NoSoftwareSignature
 	cfg.Server.Servers = c.servers(s.Servers, s.Upstreams, cfg.Server.SoftwareSignature)
-	module := c.module(s.Script, s.ScriptFile)
-	if module != nil {
-		cfg.ScriptPrints = module.Prints()
-	}
-	cfg.Server.Rules = c.rules(s.Rules, cfg.Server.Servers, module)
+	scope := newScope(cfg.Server.Upstreams, cfg.Server.Servers)
+	c.module(scope, s.Script, s.ScriptFile)
+	cfg.ScriptPrints = scope.Prints()
+	c.hooks(scope, s.Servers, cfg.Server.Servers, cfg.Server.SoftwareSignature)
+	cfg.Server.Rules = c.rules(s.Rules, cfg.Server.Servers, scope)
 	return cfg, c.errs
+}
+
+// newScope returns the scope of the scripts of a configuration with upstreams
+// and servers.
+func newScope(upstreams map[string]upstream.Config, servers map[string]server.VirtualServer) *script.Scope {
+	var upstreamInfos []script.UpstreamInfo
+	for _, id := range slices.Sorted(maps.Keys(upstreams)) {
+		upstreamInfos = append(upstreamInfos, script.UpstreamInfo{ID: id, Address: upstreams[id].Address()})
+	}
+	var serverInfos []script.ServerInfo
+	for _, id := range slices.Sorted(maps.Keys(servers)) {
+		vs := servers[id]
+		serverInfos = append(serverInfos, script.ServerInfo{
+			ID:             id,
+			StaticStatus:   vs.Status,
+			Upstream:       vs.Upstream,
+			ClientProtocol: vs.ClientProtocol,
+			Kick:           vs.Kick,
+		})
+	}
+	return script.NewScope(upstreamInfos, serverInfos)
+}
+
+// hooks compiles the hooks of the servers of entries into servers, with
+// scope, so that their results are checked like the statuses and kick
+// messages of the configuration.
+func (c *checker) hooks(scope *script.Scope, entries map[string]serverSettings, servers map[string]server.VirtualServer, signed bool) {
+	for _, id := range slices.Sorted(maps.Keys(entries)) {
+		key, entry, vs := "servers."+id, entries[id], servers[id]
+		if entry.PingScript != "" {
+			hook, err := scope.CompilePingHook(entry.PingScript, id, func(st *status.Status, clientProtocol status.ClientProtocol) error {
+				return server.CheckStatusLength(st, clientProtocol, signed)
+			})
+			if err != nil {
+				c.fail(key+".ping_script", err)
+			}
+			vs.PingHook = hook
+		}
+		if entry.JoinScript != "" {
+			hook, err := scope.CompileJoinHook(entry.JoinScript, id, server.CheckKickLength)
+			if err != nil {
+				c.fail(key+".join_script", err)
+			}
+			vs.JoinHook = hook
+		}
+		servers[id] = vs
+	}
 }
 
 // duration returns the positive duration at key, or def if unset.
@@ -496,24 +547,21 @@ func (c *checker) servers(entries map[string]serverSettings, upstreams map[strin
 	return servers
 }
 
-// clientProtocol parses the name of a server.ClientProtocol.
-func (c *checker) clientProtocol(key, text string) server.ClientProtocol {
-	switch text {
-	case "", "auto":
-		return server.ClientProtocolAuto
-	case "always":
-		return server.ClientProtocolAlways
-	case "never":
-		return server.ClientProtocolNever
+func (c *checker) clientProtocol(key, text string) status.ClientProtocol {
+	if text == "" {
+		return status.ClientProtocolAuto
 	}
-	c.failf(key, "must be auto, always or never, got %q", text)
-	return server.ClientProtocolAuto
+	cp, ok := status.ParseClientProtocol(text)
+	if !ok {
+		c.failf(key, "must be auto, always or never, got %q", text)
+	}
+	return cp
 }
 
 // status returns the status at key made of fields, or nil if invalid. Its
 // favicon may be the path of a PNG file, and its description, if text that
 // starts with "{", is JSON (see jsonComponent).
-func (c *checker) status(key string, fields statusSettings, clientProtocol server.ClientProtocol, signed bool) *status.Status {
+func (c *checker) status(key string, fields statusSettings, clientProtocol status.ClientProtocol, signed bool) *status.Status {
 	if favicon, ok := fields["favicon"]; ok {
 		faviconKey := key + ".favicon"
 		path, ok := favicon.(string)
@@ -575,7 +623,7 @@ func (c *checker) kick(key string, message any) json.RawMessage {
 // the default server, so that every client gets an answer. A rule without
 // conditions applies to every client, so the ones after it never apply, which
 // is an error.
-func (c *checker) rules(entries []ruleSettings, servers map[string]server.VirtualServer, module *script.Module) []server.Rule {
+func (c *checker) rules(entries []ruleSettings, servers map[string]server.VirtualServer, scope *script.Scope) []server.Rule {
 	rules := make([]server.Rule, 0, len(entries)+1)
 	names := make(map[string]int, len(entries))
 	unconditional := -1 // The first rule without conditions, if any.
@@ -603,7 +651,7 @@ func (c *checker) rules(entries []ruleSettings, servers map[string]server.Virtua
 			}
 		}
 		if entry.When != "" {
-			if when, err := script.Compile(entry.When, module); err != nil {
+			if when, err := scope.CompileCondition(entry.When); err != nil {
 				c.fail(key+".when", err)
 			} else {
 				rule.Conditions = append(rule.Conditions, when)
@@ -621,32 +669,21 @@ func (c *checker) rules(entries []ruleSettings, servers map[string]server.Virtua
 	return append(rules, server.Rule{Name: defaultRuleName, Server: defaultServerID})
 }
 
-// module returns the script module, written in src or in the file at path, or
-// nil if neither is set or if it is invalid.
-func (c *checker) module(src, path string) *script.Module {
+// module loads the script module of scope, written in src or in the file at
+// path, if either is set.
+func (c *checker) module(scope *script.Scope, src, path string) {
 	switch {
 	case src != "" && path != "":
 		c.failf("script_file", "cannot be set together with script")
-		return nil
 	case path != "":
-		data, err := os.ReadFile(path)
-		if err != nil {
-			c.fail("script_file", err)
-			return nil
-		}
-		m, err := script.LoadModule(string(data))
-		if err != nil {
+		if err := scope.LoadModuleFile(path); err != nil {
 			c.fail("script_file", err)
 		}
-		return m
 	case src != "":
-		m, err := script.LoadModule(src)
-		if err != nil {
+		if err := scope.LoadModule(src); err != nil {
 			c.fail("script", err)
 		}
-		return m
 	}
-	return nil
 }
 
 // ruleName checks the name of a rule, made like IDs, but not only of digits
@@ -730,6 +767,10 @@ func jsonComponent(text string) (json.RawMessage, error) {
 	var syntaxErr *json.SyntaxError
 	if err := json.Unmarshal([]byte(text), new(any)); errors.As(err, &syntaxErr) {
 		return nil, fmt.Errorf(`invalid JSON at byte %d: %w (for plain text that starts with "{", write { text: "..." })`, syntaxErr.Offset, err)
+	}
+	// Duplicate names are refused, as in statuses (see status.ParseValue).
+	if _, err := status.ParseValue([]byte(text)); err != nil {
+		return nil, err
 	}
 	return json.RawMessage(text), nil
 }

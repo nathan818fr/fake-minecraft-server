@@ -93,7 +93,7 @@ func startUpstream(t *testing.T, ln net.Listener, statusJSON string, logs io.Wri
 		t.Fatal(err)
 	}
 	srv, err := server.New(server.Config{
-		Servers:           map[string]server.VirtualServer{"default": {Status: st, ClientProtocol: server.ClientProtocolNever, Kick: json.RawMessage(`"Bye"`)}},
+		Servers:           map[string]server.VirtualServer{"default": {Status: st, ClientProtocol: status.ClientProtocolNever, Kick: json.RawMessage(`"Bye"`)}},
 		Rules:             []server.Rule{{Name: "default", Server: "default"}},
 		ConnectionTimeout: time.Second,
 		HandshakeTimeout:  time.Second,
@@ -140,8 +140,8 @@ func TestPoller(t *testing.T) {
 	stopUpstream := startUpstream(t, ln, upstreamStatus, upstreamLogs)
 	p, logs, stop := startPoller(t, testConfig(ln.Addr().String()))
 
-	waitFor(t, "a status", func() bool { return p.Status() != nil })
-	if got := string(p.Status().AppendJSON(nil)); got != upstreamStatus {
+	waitFor(t, "a status", func() bool { return p.State().Status != nil })
+	if got := string(p.State().Status.AppendJSON(nil)); got != upstreamStatus {
 		t.Errorf("status = %s, want %s", got, upstreamStatus)
 	}
 	waitFor(t, "several polls", func() bool { return strings.Count(upstreamLogs.String(), "server list ping") >= 3 })
@@ -181,7 +181,7 @@ func TestPollerShortensLoggedVersion(t *testing.T) {
 	ln := listen(t, "127.0.0.1:0")
 	startUpstream(t, ln, `{"version":{"name":"a`+strings.Repeat("§", 40)+`","protocol":773}}`, io.Discard)
 	p, logs, stop := startPoller(t, testConfig(ln.Addr().String()))
-	waitFor(t, "a status", func() bool { return p.Status() != nil })
+	waitFor(t, "a status", func() bool { return p.State().Status != nil })
 	stop()
 
 	if want := `version="a` + strings.Repeat("§", 31) + `..."`; !strings.Contains(logs.String(), want) {
@@ -198,17 +198,21 @@ func TestPollerAvailability(t *testing.T) {
 	cfg := testConfig(addr)
 	p, logs, _ := startPoller(t, cfg)
 
-	waitFor(t, "a status", func() bool { return p.Status() != nil })
+	waitFor(t, "a status", func() bool { return p.State().Status != nil })
 	stopUpstream()
 	stoppedAt := time.Now()
-	waitFor(t, "the status to expire", func() bool { return p.Status() == nil })
+	waitFor(t, "the status to expire", func() bool { return p.State().Status == nil })
 	if elapsed := time.Since(stoppedAt); elapsed < cfg.MaxAge/2 {
 		t.Errorf("status expired %v after the upstream stopped, want about %v", elapsed, cfg.MaxAge)
+	}
+	// The state still tells about the last successful poll.
+	if st := p.State(); !st.Polled || st.Latency <= 0 || st.Age < cfg.MaxAge {
+		t.Errorf("State() = %+v, want the last poll, older than MaxAge", st)
 	}
 	waitFor(t, "unavailability to be logged", func() bool { return strings.Contains(logs.String(), "upstream unavailable") })
 
 	startUpstream(t, listen(t, addr), upstreamStatus, io.Discard)
-	waitFor(t, "a status", func() bool { return p.Status() != nil })
+	waitFor(t, "a status", func() bool { return p.State().Status != nil })
 	waitFor(t, "availability to be logged", func() bool { return strings.Count(logs.String(), "upstream available") == 2 })
 	if n := strings.Count(logs.String(), "upstream unavailable"); n != 1 {
 		t.Errorf("unavailability logged %d times, want once: %s", n, logs)
@@ -252,7 +256,7 @@ func TestPollerFailures(t *testing.T) {
 			if !want.MatchString(logs.String()) {
 				t.Errorf("logs = %q, want them to match %s", logs, want)
 			}
-			if p.Status() != nil {
+			if p.State().Status != nil {
 				t.Error("Status() is not nil")
 			}
 		})
@@ -305,7 +309,7 @@ func TestPollerFollowsSRVRecord(t *testing.T) {
 	cancel()
 	<-done
 
-	if p.Status() == nil {
+	if p.State().Status == nil {
 		t.Error("Status() is nil, want the status of the upstream")
 	}
 	if names := resolver.lookups(); len(names) < 2 || names[0] != "_minecraft._tcp.mc.example.com" {

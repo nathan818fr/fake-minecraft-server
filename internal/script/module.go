@@ -3,6 +3,7 @@ package script
 import (
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 
 	"go.starlark.net/starlark"
@@ -13,55 +14,76 @@ import (
 // so that it can build large tables, but never hangs the startup.
 const maxLoadSteps = 1_000_000
 
+// scriptVariables are the variables that scripts see besides fms: client and
+// ctx in conditions and hooks, and server in hooks. The functions of a module
+// take them as parameters of the same name, whose attributes are checked like
+// theirs (see checkFields).
+var scriptVariables = []string{"client", "ctx", "server"}
+
 // reservedNames are the names of the variables that scripts see, which modules
 // must not define, so that they never hide them.
-var reservedNames = []string{"client", "fms"}
+var reservedNames = append([]string{"fms"}, scriptVariables...)
 
-// Module is the script of a configuration: the functions and constants that
-// conditions can use. Its globals are frozen, so that requests share them.
-type Module struct {
+// module is the script module of a configuration: the functions and constants
+// that its scripts can use. Its globals are frozen, so that requests share
+// them.
+type module struct {
 	globals starlark.StringDict
-	prints  []string
 }
 
-// LoadModule runs src, a Starlark file, once, and returns its globals. It
-// checks, like Compile, the fields of client and the literal arguments of the
-// functions, and reports the mistakes of src with their positions in it.
-func LoadModule(src string) (*Module, error) {
+// LoadModule runs src, a Starlark file, once, and gives its globals to the
+// scripts compiled with s from then on. It checks, like CompileCondition,
+// the fields of client and the literal arguments of the functions, and
+// reports the mistakes of src with their positions in it.
+func (s *Scope) LoadModule(src string) (err error) {
+	defer func() { s.moduleFailed = err != nil }()
 	file, err := dialect.Parse("", src, 0)
 	if err != nil {
-		return nil, positioned(err, 0)
+		return positioned(err, 0)
 	}
 	if err := checkModuleStmts(file); err != nil {
-		return nil, err
+		return err
 	}
-	if err := checkFields(file, 0); err != nil {
-		return nil, err
+	if err := checkFields(file, 0, scriptVariables); err != nil {
+		return err
 	}
-	if err := checkLiterals(file, 0); err != nil {
-		return nil, err
+	if err := s.checkLiterals(file, 0); err != nil {
+		return err
 	}
 
 	predeclared := starlark.StringDict{"fms": fmsModule()}
 	program, err := starlark.FileProgram(file, predeclared.Has)
 	if err != nil {
-		return nil, positioned(err, 0)
+		return positioned(err, 0)
 	}
-	m := &Module{}
-	thread := &starlark.Thread{Print: func(_ *starlark.Thread, msg string) { m.prints = append(m.prints, msg) }}
+	m := &module{}
+	thread := &starlark.Thread{Print: func(_ *starlark.Thread, msg string) { s.prints = append(s.prints, msg) }}
 	thread.SetMaxExecutionSteps(maxLoadSteps)
 	globals, err := program.Init(thread, predeclared)
 	if err != nil {
-		return nil, loadError(err)
+		return loadError(err)
 	}
 	globals.Freeze()
 	m.globals = globals
-	return m, nil
+	s.module = m
+	return nil
 }
 
-// Prints returns what the top level of m printed when loaded.
-func (m *Module) Prints() []string {
-	return m.prints
+// LoadModuleFile is LoadModule for the source in the file at path. A file
+// that cannot be read fails the module too (see Scope.moduleFailed).
+func (s *Scope) LoadModuleFile(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		s.moduleFailed = true
+		return err
+	}
+	return s.LoadModule(string(data))
+}
+
+// Prints returns what the top level of the module of s printed when loaded,
+// even if it then failed, which may tell why.
+func (s *Scope) Prints() []string {
+	return s.prints
 }
 
 // checkModuleStmts checks the top-level statements of file: no load, as a

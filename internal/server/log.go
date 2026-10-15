@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -91,6 +92,9 @@ func (s *Server) logSession(sess *session, err error) {
 	for _, ruleErr := range sess.ruleErrors {
 		s.logRuleError(c, ruleErr)
 	}
+	for _, hookErr := range sess.hookErrors {
+		s.logHookError(c, hookErr)
+	}
 	dropped, ok := s.allowConnection()
 	if !ok {
 		return
@@ -143,7 +147,7 @@ func appendHostAttrs(attrs []slog.Attr, host, extra string, port uint16) []slog.
 // server answered sess, if any, where its status came from, for status
 // requests, and which rules failed, whose rule failed lines may be suppressed.
 func appendRuleAttrs(attrs []slog.Attr, sess *session) []slog.Attr {
-	attrs = append(attrs, optionalString("rule", sess.rule), optionalString("server", sess.server), optionalString("source", string(sess.statusSource)))
+	attrs = append(attrs, optionalString("rule", sess.rule), optionalString("server", sess.server), optionalString("source", string(sess.source)))
 	if len(sess.ruleErrors) == 0 {
 		return attrs
 	}
@@ -204,17 +208,27 @@ func (s *Server) logConnection(msg string, c *connInfo, line []slog.Attr, droppe
 	s.logger.LogAttrs(context.Background(), slog.LevelInfo, msg, line...)
 }
 
-// logRuleError logs a rule whose condition failed, which did not apply, with
-// the values of the fields of the client that it read, in a client group, as
-// written in conditions, so that their names never clash with the other
-// attributes. Its lines are limited for each
-// rule (see ruleErrorLimiter).
+// logRuleError logs a rule whose condition failed, which did not apply.
 func (s *Server) logRuleError(c *connInfo, ruleErr ruleError) {
+	s.logScriptError(c, scriptKey{name: ruleErr.rule}, ruleErr.err, slog.String("rule", ruleErr.rule))
+}
+
+// logHookError logs a hook that failed, which the server answered without.
+func (s *Server) logHookError(c *connInfo, hookErr hookError) {
+	s.logScriptError(c, scriptKey{hook: hookErr.hook, name: hookErr.server}, hookErr.err, slog.String("server", hookErr.server))
+}
+
+// logScriptError logs err, the error of the script key about the connection c,
+// with where, the rule or the server of the script, and the values of the
+// fields of the client that it read, in a client group, as written in scripts,
+// so that their names never clash with the other attributes. Its lines are
+// limited for each script (see scriptErrorLimiter).
+func (s *Server) logScriptError(c *connInfo, key scriptKey, err error, where slog.Attr) {
 	if !s.logger.Enabled(context.Background(), slog.LevelWarn) {
 		return
 	}
 	now := time.Now()
-	suppressed, ok := s.ruleErrorLimiter.allow(ruleErr.rule, now)
+	suppressed, ok := s.scriptErrorLimiter.allow(key, now)
 	if !ok {
 		return
 	}
@@ -223,25 +237,30 @@ func (s *Server) logRuleError(c *connInfo, ruleErr ruleError) {
 		return
 	}
 	var fields []slog.Attr
-	var condErr *script.Error
-	if errors.As(ruleErr.err, &condErr) {
-		for _, f := range condErr.Fields {
-			fields = append(fields, conditionFieldAttr(f))
+	var scriptErr *script.Error
+	if errors.As(err, &scriptErr) {
+		for _, f := range scriptErr.Fields {
+			fields = append(fields, clientFieldAttr(f))
 		}
 	}
+	msg := "rule failed"
+	if key.hook != "" {
+		msg = strings.ReplaceAll(key.hook, "_", " ") + " failed" // Such as "ping script failed".
+	}
 	var buf [maxLineAttrs]slog.Attr
-	line := append(c.appendAddrs(buf[:0]), slog.String("rule", ruleErr.rule), slog.GroupAttrs("client", fields...), suppressed, dropped, logging.Error(ruleErr.err))
-	s.logger.LogAttrs(context.Background(), slog.LevelWarn, "rule failed", line...)
+	line := append(c.appendAddrs(buf[:0]), where, slog.GroupAttrs("client", fields...), suppressed, dropped, logging.Error(err))
+	s.logger.LogAttrs(context.Background(), slog.LevelWarn, msg, line...)
 }
 
-// trustedFields are the fields of the client of conditions that clients do not
-// send, logged as plain strings like on the other lines. The others, and the
-// ones to come, are untrusted.
-var trustedFields = map[string]bool{"request": true, "legacy_ping_version": true, "ip": true, "listener": true}
+// trustedFields are the fields of the client of scripts that this server
+// formats itself, which cannot hold characters to escape, logged as plain
+// strings like on the other lines. The others, and the ones to come, are
+// untrusted.
+var trustedFields = map[string]bool{"request": true, "legacy_ping_version": true, "ip": true, "listener": true, "uuid": true}
 
-// conditionFieldAttr returns the attribute logging f as the other lines log the
+// clientFieldAttr returns the attribute logging f as the other lines log the
 // same value.
-func conditionFieldAttr(f script.Field) slog.Attr {
+func clientFieldAttr(f script.Field) slog.Attr {
 	switch value := f.Value.(type) {
 	case string:
 		if trustedFields[f.Name] {
@@ -259,17 +278,20 @@ func conditionFieldAttr(f script.Field) slog.Attr {
 // scriptPrinter returns the function that logs what scripts print about the
 // connection c, at the debug level, with where, the rule or hook that printed.
 // It is nil, which drops prints, when debug lines are not logged.
-func (s *Server) scriptPrinter(c *connInfo, where slog.Attr) func(msg string) {
+func (s *Server) scriptPrinter(c *connInfo, where ...slog.Attr) func(msg string) {
 	if !s.logger.Enabled(context.Background(), slog.LevelDebug) {
 		return nil
 	}
+	// A copy, so that the arguments of callers stay on their stack when debug
+	// lines are not logged.
+	attrs := slices.Clone(where)
 	return func(msg string) {
 		dropped, ok := s.logLimiter.allow(time.Now())
 		if !ok {
 			return
 		}
 		var buf [maxLineAttrs]slog.Attr
-		line := append(c.appendAddrs(buf[:0]), where, logging.Untrusted("text", msg), dropped)
+		line := append(append(c.appendAddrs(buf[:0]), attrs...), logging.Untrusted("text", msg), dropped)
 		s.logger.LogAttrs(context.Background(), slog.LevelDebug, "script print", line...)
 	}
 }
@@ -332,40 +354,47 @@ func (h *headRecorder) bytes() []byte {
 	return h.buf[:h.n]
 }
 
-// ruleErrorInterval is how often each rule that keeps failing is logged.
-const ruleErrorInterval = time.Minute
+// scriptErrorInterval is how often each script that keeps failing is logged.
+const scriptErrorInterval = time.Minute
 
-// ruleErrorLimiter bounds the rule failed lines of each rule to one per
-// ruleErrorInterval, so that a rule failing for many clients does not repeat
-// the same line for each, nor take the lines of the others. Suppressed lines
-// are counted and reported by the next line of the rule. Its zero value is
-// ready to use.
-type ruleErrorLimiter struct {
-	mu    sync.Mutex
-	rules map[string]*ruleErrors // By rule name: as many as the rules.
+// scriptErrorLimiter bounds the failure lines of each rule, and of each hook
+// of each server, to one per scriptErrorInterval, so that a script failing for
+// many clients does not repeat the same line for each, nor take the lines of
+// the others. Suppressed lines are counted and reported by the next line of
+// the same script. Its zero value is ready to use.
+type scriptErrorLimiter struct {
+	mu      sync.Mutex
+	scripts map[scriptKey]*scriptErrors // As many as the rules and hooks.
 }
 
-type ruleErrors struct {
+// scriptKey identifies a script for scriptErrorLimiter: the conditions of the
+// rule name, or the hook of the server name.
+type scriptKey struct {
+	hook string // "" for the conditions of a rule.
+	name string
+}
+
+type scriptErrors struct {
 	logged     time.Time
 	suppressed int
 }
 
-// allow reports whether a failure of rule can be logged now and, if so, an
-// attribute counting the ones of rule suppressed before it (empty if none, so
-// not logged). The count restarts even if logLimiter then drops the line,
-// which dropped= reports.
-func (l *ruleErrorLimiter) allow(rule string, now time.Time) (slog.Attr, bool) {
+// allow reports whether a failure of the script key can be logged now and, if
+// so, an attribute counting the ones of that script suppressed before it
+// (empty if none, so not logged). The count restarts even if logLimiter then
+// drops the line, which dropped= reports.
+func (l *scriptErrorLimiter) allow(key scriptKey, now time.Time) (slog.Attr, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	errs := l.rules[rule]
+	errs := l.scripts[key]
 	if errs == nil {
-		if l.rules == nil {
-			l.rules = make(map[string]*ruleErrors)
+		if l.scripts == nil {
+			l.scripts = make(map[scriptKey]*scriptErrors)
 		}
-		errs = &ruleErrors{}
-		l.rules[rule] = errs
-	} else if now.Sub(errs.logged) < ruleErrorInterval {
+		errs = &scriptErrors{}
+		l.scripts[key] = errs
+	} else if now.Sub(errs.logged) < scriptErrorInterval {
 		errs.suppressed++
 		return slog.Attr{}, false
 	}
