@@ -49,12 +49,12 @@ func TestCompile(t *testing.T) {
 		{`"host_extra" in dir(client) and type(client) == "client"`, modernJoin, true},
 	}
 	for _, tc := range tests {
-		c, err := Compile(tc.src, nil)
+		c, err := NewScope(nil, nil).CompileCondition(tc.src)
 		if err != nil {
-			t.Errorf("Compile(%q) error: %v", tc.src, err)
+			t.Errorf("CompileCondition(%q) error: %v", tc.src, err)
 			continue
 		}
-		if got, err := c.Match(&Request{Client: &tc.client}); err != nil || got != tc.want {
+		if got, err := c.Match(&Request{Client: &tc.client}, nil); err != nil || got != tc.want {
 			t.Errorf("%q: Match() = %v, %v, want %v", tc.src, got, err, tc.want)
 		}
 	}
@@ -70,6 +70,7 @@ func TestCompileErrors(t *testing.T) {
 		{`client.protocol <`, "1:18: got end of file, want primary expression"},
 		{"client.protocol >= 0 and\n  client.protcol < 47", "2:10: client has no .protcol field or method (did you mean .protocol?)"},
 		{"client.protocol >= 0 or\n  client.protcol < 47", "2:10: client has no .protcol field or method (did you mean .protocol?)"},
+		{`client.port > 0 or ctx.upstreem("lobby")`, "1:24: ctx has no .upstreem field or method (did you mean .upstream?)"},
 		{`protocol < 47`, "1:1: undefined: protocol"},
 		{`True) or (False`, "1:5: unexpected ')'"},
 		{`x = 1`, "1:4: got '=' after expression, want EOF"},
@@ -91,8 +92,8 @@ func TestCompileErrors(t *testing.T) {
 		{`client.port > 0 or fms.matche(client.host, "a")`, "1:24: module has no .matche field or method (did you mean .matches?)"},
 	}
 	for _, tc := range tests {
-		if _, err := Compile(tc.src, nil); err == nil || err.Error() != tc.want {
-			t.Errorf("Compile(%q) error = %v, want %s", tc.src, err, tc.want)
+		if _, err := NewScope(nil, nil).CompileCondition(tc.src); err == nil || err.Error() != tc.want {
+			t.Errorf("CompileCondition(%q) error = %v, want %s", tc.src, err, tc.want)
 		}
 	}
 }
@@ -101,11 +102,11 @@ func TestCompileErrors(t *testing.T) {
 // computed from what clients sent, and the values of the fields that they
 // read.
 func TestMatchErrors(t *testing.T) {
-	c, err := Compile(`fms.matches(client.host, client.host_extra or "^$")`, nil)
+	c, err := NewScope(nil, nil).CompileCondition(`fms.matches(client.host, client.host_extra or "^$")`)
 	if err != nil {
-		t.Fatalf("Compile() error: %v", err)
+		t.Fatalf("CompileCondition() error: %v", err)
 	}
-	_, err = c.Match(&Request{Client: &Client{Host: "a.com", HostExtra: "("}})
+	_, err = c.Match(&Request{Client: &Client{Host: "a.com", HostExtra: "("}}, nil)
 	if err == nil || !strings.HasPrefix(err.Error(), "fms.matches: error parsing regexp") {
 		t.Errorf("Match() error = %v, want an invalid regexp", err)
 	}
@@ -119,37 +120,47 @@ func TestMatchErrors(t *testing.T) {
 // The fields read are recorded wherever they are read, such as by a function
 // that the client is passed to, and only those.
 func TestMatchErrorsFieldsRead(t *testing.T) {
-	c, err := Compile(`[f(client) for f in [lambda c: c.port >= 0]][0] and fms.matches(client.host, client.host_extra or "^$")`, nil)
+	c, err := NewScope(nil, nil).CompileCondition(`[f(client) for f in [lambda c: c.port >= 0]][0] and fms.matches(client.host, client.host_extra or "^$")`)
 	if err != nil {
-		t.Fatalf("Compile() error: %v", err)
+		t.Fatalf("CompileCondition() error: %v", err)
 	}
-	_, err = c.Match(&Request{Client: &Client{Host: "a.com", HostExtra: "(", Port: 1}})
+	_, err = c.Match(&Request{Client: &Client{Host: "a.com", HostExtra: "(", Port: 1}}, nil)
 	var condErr *Error
 	want := []Field{{"host", "a.com"}, {"host_extra", "("}, {"port", 1}}
 	if !errors.As(err, &condErr) || !slices.Equal(condErr.Fields, want) {
 		t.Errorf("Match() error = %#v, want the fields %v", err, want)
 	}
+
+	// Writing the client reads all its fields.
+	c, err = NewScope(nil, nil).CompileCondition(`str(client) != "" and fms.matches(client.host, client.host_extra or "^$")`)
+	if err != nil {
+		t.Fatalf("CompileCondition() error: %v", err)
+	}
+	_, err = c.Match(&Request{Client: &Client{HostExtra: "("}}, nil)
+	if !errors.As(err, &condErr) || len(condErr.Fields) != len(clientKind.attrs) {
+		t.Errorf("Match() error = %#v, want all the fields", err)
+	}
 }
 
-// print is ignored.
+// print returns None, and what it prints goes nowhere without a printer.
 func TestPrint(t *testing.T) {
-	c, err := Compile(`print(client) == None`, nil)
+	c, err := NewScope(nil, nil).CompileCondition(`print(client) == None`)
 	if err != nil {
-		t.Fatalf("Compile() error: %v", err)
+		t.Fatalf("CompileCondition() error: %v", err)
 	}
-	if got, err := c.Match(&Request{Client: &modernJoin}); err != nil || !got {
+	if got, err := c.Match(&Request{Client: &modernJoin}, nil); err != nil || !got {
 		t.Errorf("Match() = %v, %v, want true", got, err)
 	}
 }
 
 func BenchmarkMatch(b *testing.B) {
-	c, err := Compile(`fms.match_host(client.host, ".a.com") and client.protocol >= 767 and not fms.in_network(client.ip, "192.168.0.0/16")`, nil)
+	c, err := NewScope(nil, nil).CompileCondition(`fms.match_host(client.host, ".a.com") and client.protocol >= 767 and not fms.in_network(client.ip, "192.168.0.0/16")`)
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		if _, err := c.Match(&Request{Client: &modernJoin}); err != nil {
+		if _, err := c.Match(&Request{Client: &modernJoin}, nil); err != nil {
 			b.Fatal(err)
 		}
 	}

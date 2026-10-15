@@ -32,15 +32,18 @@ func clientProtocolVersion(sess *session) (int32, bool) {
 	}
 }
 
-// CheckStatusLength checks that st, the static status of a server with
-// clientProtocol, fits in a status response, even with the longest protocol
-// version if it may be the one of each client, and with the signature if
-// signed.
-func CheckStatusLength(st *status.Status, clientProtocol ClientProtocol, signed bool) error {
-	if clientProtocol.replaces(st) {
+// CheckStatusLength checks that st, a status answered with clientProtocol,
+// such as the static status of a server or what its ping hook returned, fits
+// in a status response, even with the longest protocol version if it may be
+// the one of each client, and with the signature if signed.
+func CheckStatusLength(st *status.Status, clientProtocol status.ClientProtocol, signed bool) error {
+	if clientProtocol.Replaces(st) {
 		st = st.WithProtocolVersion(math.MinInt32)
 	}
-	return checkStatusJSON(appendStatusJSON(nil, st, signed))
+	buf := statusBuffers.Get().(*[]byte)
+	defer statusBuffers.Put(buf)
+	*buf = appendStatusJSON((*buf)[:0], st, signed)
+	return checkStatusJSON(*buf)
 }
 
 // CheckKickLength checks that kick fits in a disconnect packet, which clients
@@ -91,8 +94,8 @@ func checkStatusJSON(json []byte) error {
 }
 
 // statusBuffers holds the buffers that statuses are encoded in, only while
-// they are written: connections waiting for their client to close would
-// otherwise each keep one, as large as the favicon.
+// they are checked or written: connections waiting for their client to close
+// would otherwise each keep one, as large as the favicon.
 var statusBuffers = sync.Pool{New: func() any { return new([]byte) }}
 
 // writeStatus sends st in a status response, with the signature if signed,

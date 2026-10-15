@@ -67,12 +67,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
-
 	logger := slog.Default()
 	logger.Info("starting", "version", currentVersion())
-	for _, msg := range cfg.ScriptPrints {
-		logger.LogAttrs(context.Background(), slog.LevelDebug, "script print", slog.String("hook", "load"), logging.Untrusted("text", msg))
-	}
+	logScriptPrints(logger, slog.LevelDebug, cfg.ScriptPrints)
 
 	srv, err := server.New(cfg.Server, logger)
 	if err != nil {
@@ -99,6 +96,7 @@ func check() error {
 	if err != nil {
 		return err
 	}
+	logScriptPrints(slog.Default(), slog.LevelDebug, cfg.ScriptPrints)
 	if _, err := server.New(cfg.Server, slog.Default()); err != nil {
 		return err
 	}
@@ -114,7 +112,20 @@ func load() (config.Config, error) {
 		// settings, are logged in the configured format too.
 		slog.SetDefault(slog.New(logging.NewHandler(os.Stdout, cfg.LogFormat, cfg.LogLevel)))
 	}
+	if err != nil {
+		// At the level of the errors, which they may explain, so that they
+		// are shown whatever the log level.
+		logScriptPrints(slog.Default(), slog.LevelError, cfg.ScriptPrints)
+	}
 	return cfg, err
+}
+
+// logScriptPrints logs prints, what the top level of the script printed when
+// loaded, at level.
+func logScriptPrints(logger *slog.Logger, level slog.Level, prints []string) {
+	for _, msg := range prints {
+		logger.LogAttrs(context.Background(), level, "script print", slog.String("hook", "load"), logging.Untrusted("text", msg))
+	}
 }
 
 // currentVersion returns the version that Go stamped in the binary from

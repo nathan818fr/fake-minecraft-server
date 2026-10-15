@@ -145,14 +145,14 @@ func (o Object) AppendJSON(b []byte) []byte {
 		}
 		b = appendString(b, m.Name)
 		b = append(b, ':')
-		b = appendValue(b, m.Value)
+		b = AppendValue(b, m.Value)
 	}
 	return append(b, '}')
 }
 
-// appendValue appends v, a value of an Object, in JSON. It panics on values of
+// AppendValue appends v, a value of an Object, in JSON. It panics on values of
 // other types.
-func appendValue(b []byte, v any) []byte {
+func AppendValue(b []byte, v any) []byte {
 	switch v := v.(type) {
 	case nil:
 		return append(b, "null"...)
@@ -168,7 +168,7 @@ func appendValue(b []byte, v any) []byte {
 			if i > 0 {
 				b = append(b, ',')
 			}
-			b = appendValue(b, item)
+			b = AppendValue(b, item)
 		}
 		return append(b, ']')
 	case Object:
@@ -183,7 +183,7 @@ func appendValue(b []byte, v any) []byte {
 // quote returns v in JSON for error messages, shortened like untrusted values
 // in logs, as it may come from servers.
 func quote(v any) string {
-	return logging.Shorten(string(appendValue(nil, v)))
+	return logging.Shorten(string(AppendValue(nil, v)))
 }
 
 // appendString appends s as a JSON string, escaping only what JSON requires:
@@ -250,10 +250,10 @@ var plainASCII = func() (plain [256]bool) {
 	return plain
 }()
 
-// decodeJSON decodes data, which holds a single JSON value, into the types of
+// ParseValue decodes data, which holds a single JSON value, into the types of
 // Object values. It rejects duplicate names in objects, which JSON parsers do
 // not all handle the same way.
-func decodeJSON(data []byte) (any, error) {
+func ParseValue(data []byte) (any, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	value, err := decodeValue(dec)

@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -20,7 +22,6 @@ import (
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/modernproto"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/proxyproto"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/script"
-	"github.com/nathan818fr/fake-minecraft-server/v2/internal/status"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/upstream"
 )
 
@@ -98,22 +99,25 @@ type ListenerOptions struct {
 type Upstream interface {
 	// Run keeps the status up to date until ctx is canceled.
 	Run(ctx context.Context)
-	// Status returns the current status of the server, or nil if it has
-	// none. It is valid (see status.Status.Check), but checked against the
-	// length limit only when answered, as it changes.
-	Status() *status.Status
+	// State returns what is known of the server now. Its status is valid (see
+	// status.Status.Check), but checked against the length limit only when
+	// answered, as it changes.
+	State() upstream.State
 }
 
 type Server struct {
 	cfg       Config
 	logger    *slog.Logger
 	upstreams map[string]Upstream
+	// upstreamIndexes number the upstreams, for the states that requests read
+	// (see upstreamState).
+	upstreamIndexes map[string]int
 
-	connLimiter      semaphore
-	clientLimiter    *clientLimiter
-	rateLimiter      rateLimiter
-	logLimiter       logLimiter
-	ruleErrorLimiter ruleErrorLimiter
+	connLimiter        semaphore
+	clientLimiter      *clientLimiter
+	rateLimiter        rateLimiter
+	logLimiter         logLimiter
+	scriptErrorLimiter scriptErrorLimiter
 }
 
 func New(cfg Config, logger *slog.Logger) (*Server, error) {
@@ -133,10 +137,15 @@ func newServer(cfg Config, upstreams map[string]Upstream, logger *slog.Logger) (
 		return nil, err
 	}
 
+	upstreamIndexes := make(map[string]int, len(upstreams))
+	for i, id := range slices.Sorted(maps.Keys(upstreams)) {
+		upstreamIndexes[id] = i
+	}
 	return &Server{
-		cfg:       cfg,
-		logger:    logger,
-		upstreams: upstreams,
+		cfg:             cfg,
+		logger:          logger,
+		upstreams:       upstreams,
+		upstreamIndexes: upstreamIndexes,
 
 		connLimiter:   newSemaphore(cfg.MaxConnections),
 		clientLimiter: newClientLimiter(cfg.MaxConnectionsPerIP),
@@ -253,11 +262,11 @@ type session struct {
 
 	handshake modernproto.Handshake
 	// rule is the name of the rule that answered, if any, server the ID of its
-	// virtual server, and statusSource where its status came from, for status
-	// requests.
-	rule         string
-	server       string
-	statusSource statusSource
+	// virtual server, and source where its answer came from: for status
+	// requests, and for joins answered by a hook.
+	rule   string
+	server string
+	source answerSource
 	// sentPingRequest reports whether the client sent a ping request after the
 	// status request, to measure its latency.
 	sentPingRequest bool
@@ -266,65 +275,96 @@ type session struct {
 	legacyPing  *legacyproto.Ping
 	legacyLogin *legacyproto.Login
 
-	// client is what conditions know about the client, made when first
-	// needed (see conditionClient).
-	client *script.Client
-	// request is what scripts know about the request (see scriptRequest).
+	// request is what scripts know about the request, made when first needed
+	// (see scriptRequest).
 	request script.Request
-	// ruleErrors are the errors of the conditions that failed.
+	// upstreamStates are the states of the upstreams that the request read,
+	// by index (see upstreamState), so that its scripts and its answer see
+	// one state of each.
+	upstreamStates []upstreamRead
+	// ruleErrors are the errors of the conditions that failed, and hookErrors
+	// the ones of the hooks.
 	ruleErrors []ruleError
+	hookErrors []hookError
 }
 
-// scriptRequest returns what scripts know about the request of sess, its
-// client made when first needed. Its Print is set by the caller of scripts.
-func (sess *session) scriptRequest() *script.Request {
+type upstreamRead struct {
+	read  bool
+	state upstream.State
+}
+
+// upstreamState returns the state of the upstream with the ID id, read once
+// per request, or an unavailable state if there is no such upstream.
+func (s *Server) upstreamState(sess *session, id string) upstream.State {
+	i, ok := s.upstreamIndexes[id]
+	if !ok {
+		return upstream.State{}
+	}
+	if sess.upstreamStates == nil {
+		sess.upstreamStates = make([]upstreamRead, len(s.upstreamIndexes))
+	}
+	r := &sess.upstreamStates[i]
+	if !r.read {
+		r.state, r.read = s.upstreams[id].State(), true
+	}
+	return r.state
+}
+
+// scriptRequest returns what scripts know about the request of sess, made
+// when first needed.
+func (s *Server) scriptRequest(sess *session) *script.Request {
 	if sess.request.Client == nil {
-		sess.request.Client = sess.conditionClient()
+		sess.request.Client = sess.scriptClient()
+		sess.request.Upstream = func(id string) upstream.State { return s.upstreamState(sess, id) }
 	}
 	return &sess.request
 }
 
-// conditionClient returns what conditions know about the client of sess.
-func (sess *session) conditionClient() *script.Client {
-	if sess.client != nil {
-		return sess.client
-	}
-	c := &script.Client{Request: script.RequestJoin, Host: sess.host(), Listener: sess.conn.listener.addr}
-	if remote := sess.conn.remote; !isUnixPeer(remote) {
-		c.IP = remote.Addr().WithZone("").String()
-	}
+func (sess *session) scriptClient() *script.Client {
+	var c script.Client
 	switch {
 	case sess.legacyPing != nil:
 		ping := sess.legacyPing
-		c.Request, c.Legacy, c.LegacyPingVersion = script.RequestPing, true, ping.Version.String()
-		c.Port, c.Protocol = int(ping.ServerPort), int(ping.ProtocolVersion)
+		c = script.Client{
+			Request:           script.RequestPing,
+			Host:              ping.ServerAddress,
+			Port:              int(ping.ServerPort),
+			Protocol:          int(ping.ProtocolVersion),
+			Legacy:            true,
+			LegacyPingVersion: ping.Version.String(),
+		}
 	case sess.legacyLogin != nil:
 		login := sess.legacyLogin
-		c.Legacy = true
-		c.Port, c.Protocol = int(login.ServerPort), int(login.ProtocolVersion)
+		c = script.Client{
+			Request:  script.RequestJoin,
+			Host:     login.ServerAddress,
+			Port:     int(login.ServerPort),
+			Protocol: int(login.ProtocolVersion),
+			Legacy:   true,
+			Username: login.Username,
+		}
 	default:
 		h := sess.handshake
+		request := script.RequestJoin
 		if h.Intent == modernproto.IntentStatus {
-			c.Request = script.RequestPing
+			request = script.RequestPing
 		}
-		c.Transferred = h.Intent == modernproto.IntentTransfer
-		c.HostExtra, c.Port, c.Protocol = h.ServerAddressExtra, int(h.ServerPort), int(h.ProtocolVersion)
+		c = script.Client{
+			Request:     request,
+			Transferred: h.Intent == modernproto.IntentTransfer,
+			Host:        h.ServerAddress,
+			HostExtra:   h.ServerAddressExtra,
+			Port:        int(h.ServerPort),
+			Protocol:    int(h.ProtocolVersion),
+			Username:    sess.loginStart.Username,
+			UUID:        sess.loginStart.UUID,
+		}
 	}
-	sess.client = c
-	return c
-}
-
-// host returns the host that the client of sess connected to, or "" if it did
-// not send one.
-func (sess *session) host() string {
-	switch {
-	case sess.legacyPing != nil:
-		return sess.legacyPing.ServerAddress
-	case sess.legacyLogin != nil:
-		return sess.legacyLogin.ServerAddress
-	default:
-		return sess.handshake.ServerAddress
+	c.Listener = sess.conn.listener.addr
+	if remote := sess.conn.remote; !isUnixPeer(remote) {
+		c.IP = remote.Addr().WithZone("").String()
 	}
+	return &c
 }
 
 // readWhole reports whether the server read the whole request of the client
@@ -499,20 +539,19 @@ func (s *Server) exchange(conn net.Conn, buffers *connBuffers, sess *session, ha
 		_, err := conn.Write(legacyproto.AppendPingResponse(nil, sess.legacyPing.Version, legacy))
 		return err
 	case sess.legacyLogin != nil:
-		_, err := conn.Write(legacyproto.AppendKick(nil, legacyproto.TextFromComponent(s.serverFor(sess).Kick)))
+		_, err := conn.Write(legacyproto.AppendKick(nil, legacyproto.TextFromComponent(s.kickFor(sess))))
 		return err
 	case sess.handshake.Intent == modernproto.IntentStatus:
 		return s.answerStatus(conn, buffers, sess, connDeadline)
 	default:
-		// Clients send a Login Start packet right after the handshake. It is
-		// only read for logging, after the kick, so that an invalid or missing
-		// one neither delays the kick nor aborts the connection.
-		kick := modernproto.AppendString(nil, string(s.serverFor(sess).Kick))
-		if _, err := conn.Write(modernproto.AppendPacket(nil, modernproto.LoginDisconnectID, kick)); err != nil {
-			return err
-		}
+		// Clients send a Login Start packet right after the handshake, which
+		// scripts see. An invalid or missing one leaves the username and UUID
+		// empty, and the player is still answered, once the handshake deadline
+		// is over.
 		sess.loginStart, _ = modernproto.ReadLoginStart(buffers.reader, sess.handshake.ProtocolVersion)
-		return nil
+		kick := modernproto.AppendString(nil, string(s.kickFor(sess)))
+		_, err := conn.Write(modernproto.AppendPacket(nil, modernproto.LoginDisconnectID, kick))
+		return err
 	}
 }
 

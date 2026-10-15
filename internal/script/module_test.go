@@ -1,15 +1,18 @@
 package script
 
 import (
+	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 )
 
 // Conditions use the functions and constants of the module, which runs once,
 // with the dialect of conditions.
 func TestModule(t *testing.T) {
-	m, err := LoadModule(`
+	s := NewScope(nil, nil)
+	err := s.LoadModule(`
 STAFF = set(["10.1.2.3"])
 PORTS = {}
 for port in [25565, 25566]:
@@ -31,15 +34,15 @@ print("loaded", len(PORTS))
 	if err != nil {
 		t.Fatalf("LoadModule() error: %v", err)
 	}
-	if want := []string{"loaded 2"}; !slices.Equal(m.Prints(), want) {
-		t.Errorf("Prints() = %q, want %q", m.Prints(), want)
+	if want := []string{"loaded 2"}; !slices.Equal(s.Prints(), want) {
+		t.Errorf("Prints() = %q, want %q", s.Prints(), want)
 	}
-	c, err := Compile(`is_staff(client) and client.port in PORTS and countdown(3) == 0 and depth(3) == 3`, m)
+	c, err := s.CompileCondition(`is_staff(client) and client.port in PORTS and countdown(3) == 0 and depth(3) == 3`)
 	if err != nil {
-		t.Fatalf("Compile() error: %v", err)
+		t.Fatalf("CompileCondition() error: %v", err)
 	}
 	for client, want := range map[*Client]bool{&modernJoin: true, &legacyPing: false} {
-		if got, err := c.Match(&Request{Client: client}); err != nil || got != want {
+		if got, err := c.Match(&Request{Client: client}, nil); err != nil || got != want {
 			t.Errorf("Match(%+v) = %v, %v, want %v", client, got, err, want)
 		}
 	}
@@ -53,7 +56,9 @@ func TestLoadModuleErrors(t *testing.T) {
 		{"x = 1\nx = 2\n", "2:1: cannot reassign global x declared at 1:1"},
 		{"load(\"other.star\", \"x\")\n", "1:1: load is not supported: a configuration has a single script"},
 		{"client = 1\n", "1:1: client is reserved for the variable that scripts see"},
+		{"ctx = 1\n", "1:1: ctx is reserved for the variable that scripts see"},
 		{"def fms():\n    pass\n", "1:5: fms is reserved for the variable that scripts see"},
+		{"for server in []:\n    pass\n", "1:5: server is reserved for the variable that scripts see"},
 		{"def f(client):\n    return client.protcol\n", "2:19: client has no .protcol field or method (did you mean .protocol?)"},
 		{"def f(client):\n    return fms.matches(client.host, \"(\")\n", "2:37: fms.matches: error parsing regexp: missing closing ): `(`"},
 		{"X = [1][2]\n", "1:8: list index 2 out of range [-1:0]"},
@@ -62,37 +67,65 @@ func TestLoadModuleErrors(t *testing.T) {
 		{"X = (\n", "2:1: got end of file, want primary expression"},
 	}
 	for _, tc := range tests {
-		if _, err := LoadModule(tc.src); err == nil || err.Error() != tc.want {
+		if err := NewScope(nil, nil).LoadModule(tc.src); err == nil || err.Error() != tc.want {
 			t.Errorf("LoadModule(%q) error = %v, want %s", tc.src, err, tc.want)
 		}
 	}
 }
 
-// The top level of a module has a larger budget than each evaluation.
-func TestLoadModuleSteps(t *testing.T) {
-	m, err := LoadModule("TABLE = {i: i * i for i in range(20000)}\ndef square(n):\n    return TABLE[n]\n")
-	if err != nil {
-		t.Fatalf("LoadModule() error: %v", err)
+// The names of a module that failed to load are not reported as typos.
+func TestModuleFailed(t *testing.T) {
+	s := NewScope(nil, nil)
+	if err := s.LoadModule("def is_staff(client):\n    return (\n"); err == nil {
+		t.Fatal("LoadModule() succeeded, want an error")
 	}
-	if _, err := Compile(`square(client.port % 1000) >= 0`, m); err != nil {
-		t.Errorf("Compile() error: %v", err)
+	if _, err := s.CompileCondition(`is_staff(client)`); err == nil || err.Error() != "1:1: undefined: is_staff (the script failed to load)" {
+		t.Errorf("CompileCondition() error = %v, want is_staff undefined, as the script failed to load", err)
+	}
+
+	// A file that cannot be read fails the module too.
+	s = NewScope(nil, nil)
+	if err := s.LoadModuleFile(filepath.Join(t.TempDir(), "missing.star")); err == nil {
+		t.Fatal("LoadModuleFile() succeeded, want an error")
+	}
+	if _, err := s.CompileCondition(`is_staff(client)`); err == nil || !strings.HasSuffix(err.Error(), "(the script failed to load)") {
+		t.Errorf("CompileCondition() error = %v, want is_staff undefined, as the script failed to load", err)
+	}
+
+	// What it printed before failing is kept, as it may tell why.
+	s = NewScope(nil, nil)
+	if err := s.LoadModule("print(\"loading\")\nX = 1 // 0\n"); err == nil {
+		t.Fatal("LoadModule() succeeded, want an error")
+	}
+	if want := []string{"loading"}; !slices.Equal(s.Prints(), want) {
+		t.Errorf("Prints() = %q, want %q", s.Prints(), want)
 	}
 }
 
-// What conditions print during a request goes to its Print, and nowhere when
-// checked with sample clients.
-func TestRequestPrint(t *testing.T) {
-	m, err := LoadModule("def log(client):\n    print(\"from\", client.ip)\n    return True\n")
-	if err != nil {
+// The top level of a module has a larger budget than each evaluation.
+func TestLoadModuleSteps(t *testing.T) {
+	s := NewScope(nil, nil)
+	if err := s.LoadModule("TABLE = {i: i * i for i in range(20000)}\ndef square(n):\n    return TABLE[n]\n"); err != nil {
 		t.Fatalf("LoadModule() error: %v", err)
 	}
-	c, err := Compile(`log(client)`, m)
+	if _, err := s.CompileCondition(`square(client.port % 1000) >= 0`); err != nil {
+		t.Errorf("CompileCondition() error: %v", err)
+	}
+}
+
+// What conditions print during a request goes to the printer of Match.
+func TestRequestPrint(t *testing.T) {
+	s := NewScope(nil, nil)
+	if err := s.LoadModule("def log(client):\n    print(\"from\", client.ip)\n    return True\n"); err != nil {
+		t.Fatalf("LoadModule() error: %v", err)
+	}
+	c, err := s.CompileCondition(`log(client)`)
 	if err != nil {
-		t.Fatalf("Compile() error: %v", err)
+		t.Fatalf("CompileCondition() error: %v", err)
 	}
 	var printed []string
-	req := &Request{Client: &modernJoin, Print: func(msg string) { printed = append(printed, msg) }}
-	if got, err := c.Match(req); err != nil || !got {
+	printer := func(msg string) { printed = append(printed, msg) }
+	if got, err := c.Match(&Request{Client: &modernJoin}, printer); err != nil || !got {
 		t.Errorf("Match() = %v, %v, want true", got, err)
 	}
 	if want := []string{"from 10.1.2.3"}; !slices.Equal(printed, want) {

@@ -73,17 +73,22 @@ func TestLogging(t *testing.T) {
 			want: `INFO  \S+ login attempt: protocol=777 host="localhost" port=25565 rule=0 server=test username="Notch" uuid=069a79f4-44e9-4726-a5be-fca90e38aaf5 ` + timing,
 		},
 		{
-			name:   "login without username",
-			client: func(c *client) { c.handshake(5, modernproto.IntentLogin); c.readPacket(modernproto.LoginDisconnectID) },
-			want:   `INFO  \S+ login attempt: protocol=5 host="localhost" port=25565 rule=0 server=test ` + timing,
+			name: "login without username",
+			client: func(c *client) {
+				c.handshake(5, modernproto.IntentLogin)
+				_ = c.conn.(*net.TCPConn).CloseWrite()
+				c.readPacket(modernproto.LoginDisconnectID)
+			},
+			want: `INFO  \S+ login attempt: protocol=5 host="localhost" port=25565 rule=0 server=test ` + timing,
 		},
 		{
 			name: "transfer",
 			client: func(c *client) {
 				c.handshake(1518, modernproto.IntentTransfer)
+				c.loginStart()
 				c.readPacket(modernproto.LoginDisconnectID)
 			},
-			want: `INFO  \S+ transfer attempt: protocol=1518 host="localhost" port=25565 rule=0 server=test ` + timing,
+			want: `INFO  \S+ transfer attempt: protocol=1518 host="localhost" port=25565 rule=0 server=test username="Steve" ` + timing,
 		},
 		{
 			name:   "timeout",
@@ -274,40 +279,44 @@ func TestLogLimiter(t *testing.T) {
 }
 
 // Each rule that keeps failing is logged once per interval, with the count of
-// its lines suppressed in between, independently of the other rules.
-func TestRuleErrorLimiter(t *testing.T) {
-	var l ruleErrorLimiter
+// its lines suppressed in between, independently of the other rules, and of
+// the hooks of servers of the same name.
+func TestScriptErrorLimiter(t *testing.T) {
+	var l scriptErrorLimiter
 	start := time.Unix(1000, 0)
 
 	for _, rule := range []string{"a", "b"} {
-		if suppressed, ok := l.allow(rule, start); !ok || !suppressed.Equal(slog.Attr{}) {
+		if suppressed, ok := l.allow(scriptKey{name: rule}, start); !ok || !suppressed.Equal(slog.Attr{}) {
 			t.Fatalf("first failure of %s: allow() = %v, %v, want an allowed line without suppressed ones", rule, suppressed, ok)
 		}
 	}
 	for i := range 3 {
-		if _, ok := l.allow("a", start.Add(ruleErrorInterval-time.Millisecond)); ok {
+		if _, ok := l.allow(scriptKey{name: "a"}, start.Add(scriptErrorInterval-time.Millisecond)); ok {
 			t.Fatalf("failure %d of a within the interval was allowed", i)
 		}
 	}
+	if _, ok := l.allow(scriptKey{hook: "ping_script", name: "a"}, start); !ok {
+		t.Fatal("the first failure of the ping script of the server a was refused, as if it were the rule a")
+	}
 
-	suppressed, ok := l.allow("a", start.Add(ruleErrorInterval))
+	suppressed, ok := l.allow(scriptKey{name: "a"}, start.Add(scriptErrorInterval))
 	if !ok {
 		t.Fatal("allow() refused a failure of a after the interval")
 	}
 	if want := slog.Int("suppressed", 3); !suppressed.Equal(want) {
 		t.Errorf("allow() reported %v, want %v", suppressed, want)
 	}
-	if suppressed, ok := l.allow("b", start.Add(ruleErrorInterval)); !ok || !suppressed.Equal(slog.Attr{}) {
+	if suppressed, ok := l.allow(scriptKey{name: "b"}, start.Add(scriptErrorInterval)); !ok || !suppressed.Equal(slog.Attr{}) {
 		t.Errorf("failure of b after the interval: allow() = %v, %v, want an allowed line without suppressed ones", suppressed, ok)
 	}
 }
 
 // Failures that the log level hides are not counted either.
-func TestRuleErrorLimiterSkipsHiddenLines(t *testing.T) {
+func TestScriptErrorLimiterSkipsHiddenLines(t *testing.T) {
 	s := &Server{logger: slog.New(logging.NewTextHandler(io.Discard, slog.LevelError))}
 	s.logRuleError(&connInfo{}, ruleError{rule: "a", err: errors.New("failed")})
-	if len(s.ruleErrorLimiter.rules) != 0 {
-		t.Errorf("hidden failures were counted: %v", s.ruleErrorLimiter.rules)
+	if len(s.scriptErrorLimiter.scripts) != 0 {
+		t.Errorf("hidden failures were counted: %v", s.scriptErrorLimiter.scripts)
 	}
 }
 
@@ -327,7 +336,8 @@ func TestLoggingRuleErrorSuppressed(t *testing.T) {
 	if n := strings.Count(logs.String(), " rule failed: "); n != 1 {
 		t.Errorf("logs = %q, want 1 rule failed line, got %d", logs.String(), n)
 	}
-	// Strings that clients do not send are not quoted, like on the other lines.
+	// Strings that the server formats itself are not quoted, like on the other
+	// lines.
 	if want := ` client.request=ping client.host="localhost" client.protocol=777 `; !strings.Contains(logs.String(), want) {
 		t.Errorf("logs = %q, want them to contain %q", logs.String(), want)
 	}
@@ -366,6 +376,7 @@ func TestLoggingRuleError(t *testing.T) {
 	c.write(modernproto.AppendHandshake(nil, modernproto.Handshake{
 		ProtocolVersion: 777, ServerAddress: "localhost", ServerAddressExtra: "(", ServerPort: 25565, Intent: modernproto.IntentLogin,
 	}))
+	c.loginStart()
 	c.readPacket(modernproto.LoginDisconnectID)
 	_ = c.conn.Close()
 	stop()
@@ -409,6 +420,7 @@ func TestLoggingScriptPrint(t *testing.T) {
 		addr, stop := startServerWithLogger(t, cfg, slog.New(logging.NewTextHandler(&logs, level)))
 		c := dial(t, addr)
 		c.handshakeTo("evil\nhost", 777, modernproto.IntentLogin)
+		c.loginStart()
 		c.readPacket(modernproto.LoginDisconnectID)
 		_ = c.conn.Close()
 		stop()

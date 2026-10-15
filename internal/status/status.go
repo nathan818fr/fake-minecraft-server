@@ -36,7 +36,7 @@ var (
 // at each ping for characters to escape would cost more than writing the rest
 // of the status.
 func Parse(data []byte) (*Status, error) {
-	value, err := decodeJSON(data)
+	value, err := ParseValue(data)
 	if err != nil {
 		return nil, err
 	}
@@ -44,9 +44,17 @@ func Parse(data []byte) (*Status, error) {
 	if !ok {
 		return nil, fmt.Errorf("must be a JSON object, got %s", quote(value))
 	}
+	return New(fields)
+}
+
+// New returns the status made of fields, after checking it, with its favicon
+// encoded like Parse does, unless it already is a json.RawMessage.
+func New(fields Object) (*Status, error) {
 	if favicon, ok := fields.Get(faviconPath); ok {
-		// With cannot fail on a path without arrays.
-		fields, _ = fields.With(faviconPath, json.RawMessage(appendValue(nil, favicon)))
+		if _, encoded := favicon.(json.RawMessage); !encoded {
+			// With cannot fail on a path without arrays.
+			fields, _ = fields.With(faviconPath, json.RawMessage(AppendValue(nil, favicon)))
+		}
 	}
 	s := &Status{Object: fields}
 	if err := s.Check(); err != nil {
@@ -148,6 +156,52 @@ func (s *Status) ProtocolVersion() (int32, bool) {
 	return int32Value(protocol)
 }
 
+// ClientProtocol is when to report the protocol version of each client in
+// place of the one of a status, so that clients see the server as compatible.
+type ClientProtocol int
+
+const (
+	// ClientProtocolAuto keeps the protocol versions that no client has (see
+	// firstClientProtocolVersion).
+	ClientProtocolAuto ClientProtocol = iota
+	ClientProtocolAlways
+	ClientProtocolNever
+)
+
+// ParseClientProtocol returns the ClientProtocol named name: "auto", "always"
+// or "never".
+func ParseClientProtocol(name string) (ClientProtocol, bool) {
+	switch name {
+	case "auto":
+		return ClientProtocolAuto, true
+	case "always":
+		return ClientProtocolAlways, true
+	case "never":
+		return ClientProtocolNever, true
+	}
+	return ClientProtocolAuto, false
+}
+
+// firstClientProtocolVersion is the protocol version of 1.7.2, the first
+// release with the modern protocol. Lower ones make clients show the status as
+// incompatible, with its version name in place of the player counts: a common
+// way to show a message such as "§cMaintenance", with -1 or 1 in plugins.
+const firstClientProtocolVersion = 4
+
+// Replaces reports whether the protocol version of st is replaced by the one
+// of each client.
+func (c ClientProtocol) Replaces(st *Status) bool {
+	switch c {
+	case ClientProtocolAlways:
+		return true
+	case ClientProtocolNever:
+		return false
+	default:
+		protocolVersion, ok := st.ProtocolVersion()
+		return !ok || protocolVersion >= firstClientProtocolVersion
+	}
+}
+
 // Players returns the player counts of s. They are zero if s does not have
 // them, or if they are invalid (see Check).
 func (s *Status) Players() Players {
@@ -168,5 +222,5 @@ func (s *Status) Description() json.RawMessage {
 	if !ok {
 		return nil
 	}
-	return appendValue(nil, description)
+	return AppendValue(nil, description)
 }

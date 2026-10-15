@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/modernproto"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/script"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/status"
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/upstream"
 )
 
 const clientTimeout = 2 * time.Second
@@ -61,12 +63,12 @@ func withStatus(cfg Config, data string) Config {
 	if err != nil {
 		panic(err)
 	}
-	cfg.Servers = map[string]VirtualServer{testServerID: {Status: st, ClientProtocol: ClientProtocolNever, Kick: json.RawMessage(testKick)}}
+	cfg.Servers = map[string]VirtualServer{testServerID: {Status: st, ClientProtocol: status.ClientProtocolNever, Kick: json.RawMessage(testKick)}}
 	cfg.Rules = []Rule{{Name: "0", Server: testServerID}}
 	return cfg
 }
 
-func withClientProtocol(cfg Config, clientProtocol ClientProtocol) Config {
+func withClientProtocol(cfg Config, clientProtocol status.ClientProtocol) Config {
 	return withServer(cfg, func(server *VirtualServer) { server.ClientProtocol = clientProtocol })
 }
 
@@ -189,6 +191,13 @@ func (c *client) handshakeTo(host string, protocolVersion int32, intent modernpr
 		ServerPort:      25565,
 		Intent:          intent,
 	}))
+}
+
+// loginStart sends the Login Start packet of Steve, which players send right
+// after the handshake, and which the server reads before answering.
+func (c *client) loginStart() {
+	c.t.Helper()
+	c.write(modernproto.AppendPacket(nil, modernproto.LoginStartID, modernproto.AppendString(nil, "Steve")))
 }
 
 func (c *client) readPacket(id byte) []byte {
@@ -378,7 +387,12 @@ type fakeUpstream struct{ st *status.Status }
 
 func (fakeUpstream) Run(context.Context) {}
 
-func (u fakeUpstream) Status() *status.Status { return u.st }
+func (u fakeUpstream) State() upstream.State {
+	if u.st == nil {
+		return upstream.State{}
+	}
+	return upstream.State{Status: u.st, Polled: true, Latency: 12 * time.Millisecond}
+}
 
 // The status of the upstream of a server is answered while it has one, and its
 // static status otherwise. Servers that no rule targets are not answered.
@@ -477,7 +491,7 @@ func withConditionRules(cfg Config, condsA, condsB []script.Condition) Config {
 		if err != nil {
 			panic(err)
 		}
-		cfg.Servers[id] = VirtualServer{Status: st, ClientProtocol: ClientProtocolNever, Kick: json.RawMessage(`"Kick ` + id + `"`)}
+		cfg.Servers[id] = VirtualServer{Status: st, ClientProtocol: status.ClientProtocolNever, Kick: json.RawMessage(`"Kick ` + id + `"`)}
 	}
 	cfg.Rules = []Rule{{Name: "a", Conditions: condsA, Server: "a"}, {Name: "b", Conditions: condsB, Server: "b"}, {Name: "0", Server: testServerID}}
 	return cfg
@@ -534,6 +548,7 @@ func TestRuleHosts(t *testing.T) {
 		}
 		c = dial(t, addr)
 		c.handshakeTo(tc.host, 777, modernproto.IntentLogin)
+		c.loginStart()
 		if got := c.readString(modernproto.LoginDisconnectID); got != wantKick {
 			t.Errorf("host %q: kick message = %s, want %s", tc.host, got, wantKick)
 		}
@@ -566,9 +581,9 @@ func TestRuleHostsOfLegacyClients(t *testing.T) {
 func withWhenRules(t *testing.T, cfg Config, whenA, whenB string) Config {
 	t.Helper()
 	compile := func(src string) []script.Condition {
-		c, err := script.Compile(src, nil)
+		c, err := script.NewScope(nil, nil).CompileCondition(src)
 		if err != nil {
-			t.Fatalf("Compile(%q) error: %v", src, err)
+			t.Fatalf("CompileCondition(%q) error: %v", src, err)
 		}
 		return []script.Condition{c}
 	}
@@ -597,10 +612,12 @@ func TestRuleConditions(t *testing.T) {
 	}{
 		{"join", `client.request == "join" and not client.transferred`, `client.transferred`, func(c *client) string {
 			c.handshake(777, modernproto.IntentLogin)
+			c.loginStart()
 			return serverOf(c.readString(modernproto.LoginDisconnectID))
 		}, "a"},
 		{"transfer", `client.request == "join" and not client.transferred`, `client.transferred`, func(c *client) string {
 			c.handshake(777, modernproto.IntentTransfer)
+			c.loginStart()
 			return serverOf(c.readString(modernproto.LoginDisconnectID))
 		}, "b"},
 		{"ping", `client.request == "join"`, `client.request == "ping" and client.protocol == 777 and client.port == 25565 and client.host == "localhost"`, func(c *client) string {
@@ -640,17 +657,17 @@ func TestRuleConditionOfProxiedClient(t *testing.T) {
 // the version name.
 func TestClientProtocol(t *testing.T) {
 	tests := []struct {
-		clientProtocol ClientProtocol
+		clientProtocol status.ClientProtocol
 		version        string
 		want           string
 	}{
-		{ClientProtocolAuto, `{"name":"Fake","protocol":47}`, `{"name":"Fake","protocol":777}`},
-		{ClientProtocolAuto, `{"name":"Fake","protocol":4}`, `{"name":"Fake","protocol":777}`},
-		{ClientProtocolAuto, `{"name":"§cMaintenance","protocol":-1}`, `{"name":"§cMaintenance","protocol":-1}`},
-		{ClientProtocolAuto, `{"name":"§cMaintenance","protocol":0}`, `{"name":"§cMaintenance","protocol":0}`},
-		{ClientProtocolAuto, `{"name":"§cMaintenance","protocol":1}`, `{"name":"§cMaintenance","protocol":1}`},
-		{ClientProtocolAlways, `{"name":"§cMaintenance","protocol":-1}`, `{"name":"§cMaintenance","protocol":777}`},
-		{ClientProtocolNever, `{"name":"Fake","protocol":47}`, `{"name":"Fake","protocol":47}`},
+		{status.ClientProtocolAuto, `{"name":"Fake","protocol":47}`, `{"name":"Fake","protocol":777}`},
+		{status.ClientProtocolAuto, `{"name":"Fake","protocol":4}`, `{"name":"Fake","protocol":777}`},
+		{status.ClientProtocolAuto, `{"name":"§cMaintenance","protocol":-1}`, `{"name":"§cMaintenance","protocol":-1}`},
+		{status.ClientProtocolAuto, `{"name":"§cMaintenance","protocol":0}`, `{"name":"§cMaintenance","protocol":0}`},
+		{status.ClientProtocolAuto, `{"name":"§cMaintenance","protocol":1}`, `{"name":"§cMaintenance","protocol":1}`},
+		{status.ClientProtocolAlways, `{"name":"§cMaintenance","protocol":-1}`, `{"name":"§cMaintenance","protocol":777}`},
+		{status.ClientProtocolNever, `{"name":"Fake","protocol":47}`, `{"name":"Fake","protocol":47}`},
 	}
 	for _, tc := range tests {
 		cfg := withClientProtocol(withStatus(testConfig, `{"version":`+tc.version+`}`), tc.clientProtocol)
@@ -661,7 +678,7 @@ func TestClientProtocol(t *testing.T) {
 }
 
 func TestStatusUsesClientProtocolVersion(t *testing.T) {
-	addr := startServer(t, withClientProtocol(testConfig, ClientProtocolAlways))
+	addr := startServer(t, withClientProtocol(testConfig, status.ClientProtocolAlways))
 
 	// 1.7.10, 26.3, a 26.1 snapshot and the lowest possible value.
 	for _, version := range []int32{5, 777, 0x4000011f, math.MinInt32} {
@@ -675,7 +692,7 @@ func TestStatusUsesClientProtocolVersion(t *testing.T) {
 // Using the protocol version of the client adds a version to statuses that
 // have none, so that clients still see the server as compatible.
 func TestStatusUsesClientProtocolVersionWithoutVersion(t *testing.T) {
-	cfg := withClientProtocol(withStatus(testConfig, `{"description":"Hi"}`), ClientProtocolAuto)
+	cfg := withClientProtocol(withStatus(testConfig, `{"description":"Hi"}`), status.ClientProtocolAuto)
 	got := dial(t, startServer(t, cfg)).statusExchange(777)["version"]
 	if want := `{"name":"","protocol":777}`; string(got) != want {
 		t.Errorf("version = %s, want %s", got, want)
@@ -731,14 +748,14 @@ func TestLegacyPing(t *testing.T) {
 	tests := []struct {
 		name           string
 		ping           []byte
-		clientProtocol ClientProtocol
+		clientProtocol status.ClientProtocol
 		want           string
 	}{
-		{"beta to 1.3", []byte{0xfe}, ClientProtocolNever, "Hello§3§20"},
-		{"1.4 to 1.5", []byte{0xfe, 0x01}, ClientProtocolNever, "§1\x0047\x00Fake 1.0\x00Hello\x003\x0020"},
-		{"1.4 to 1.5 with the client's protocol version", []byte{0xfe, 0x01}, ClientProtocolAlways, "§1\x0061\x00Fake 1.0\x00Hello\x003\x0020"},
-		{"1.6", legacyPing16, ClientProtocolNever, "§1\x0047\x00Fake 1.0\x00Hello\x003\x0020"},
-		{"1.6 with the client's protocol version", legacyPing16, ClientProtocolAlways, "§1\x0073\x00Fake 1.0\x00Hello\x003\x0020"},
+		{"beta to 1.3", []byte{0xfe}, status.ClientProtocolNever, "Hello§3§20"},
+		{"1.4 to 1.5", []byte{0xfe, 0x01}, status.ClientProtocolNever, "§1\x0047\x00Fake 1.0\x00Hello\x003\x0020"},
+		{"1.4 to 1.5 with the client's protocol version", []byte{0xfe, 0x01}, status.ClientProtocolAlways, "§1\x0061\x00Fake 1.0\x00Hello\x003\x0020"},
+		{"1.6", legacyPing16, status.ClientProtocolNever, "§1\x0047\x00Fake 1.0\x00Hello\x003\x0020"},
+		{"1.6 with the client's protocol version", legacyPing16, status.ClientProtocolAlways, "§1\x0073\x00Fake 1.0\x00Hello\x003\x0020"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -812,7 +829,7 @@ func TestFragmentedLegacyPing(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			// The protocol version of the client shows which ping was read.
-			c := dial(t, startServer(t, withClientProtocol(testConfig, ClientProtocolAlways)))
+			c := dial(t, startServer(t, withClientProtocol(testConfig, status.ClientProtocolAlways)))
 			c.write(tc.ping[:tc.split])
 			time.Sleep(100 * time.Millisecond)
 			c.write(tc.ping[tc.split:])
@@ -835,6 +852,7 @@ func TestFragmentedHandshake(t *testing.T) {
 		c.write([]byte{b})
 		time.Sleep(time.Millisecond)
 	}
+	c.loginStart()
 	c.readString(modernproto.LoginDisconnectID)
 }
 
@@ -853,6 +871,7 @@ func TestHandshakeResemblingLegacyPing(t *testing.T) {
 	}
 
 	c.write(handshake)
+	c.loginStart()
 	c.readString(modernproto.LoginDisconnectID)
 }
 
@@ -1174,5 +1193,167 @@ func BenchmarkStatusExchange(b *testing.B) {
 			b.Fatal(err)
 		}
 		_ = conn.Close()
+	}
+}
+
+// withHooks returns cfg with ping and join, if not empty, as the hooks of its
+// server testServerID, which sees the upstreams with the IDs upstreams.
+func withHooks(t *testing.T, cfg Config, upstreams []string, ping, join string) Config {
+	t.Helper()
+	var upstreamInfos []script.UpstreamInfo
+	for _, id := range upstreams {
+		upstreamInfos = append(upstreamInfos, script.UpstreamInfo{ID: id, Address: id + ".example.com"})
+	}
+	var serverInfos []script.ServerInfo
+	for id, vs := range cfg.Servers {
+		serverInfos = append(serverInfos, script.ServerInfo{ID: id, StaticStatus: vs.Status, Upstream: vs.Upstream, ClientProtocol: vs.ClientProtocol, Kick: vs.Kick})
+	}
+	scope := script.NewScope(upstreamInfos, serverInfos)
+	return withServer(cfg, func(server *VirtualServer) {
+		var err error
+		if ping != "" {
+			server.PingHook, err = scope.CompilePingHook(ping, testServerID, func(st *status.Status, clientProtocol status.ClientProtocol) error {
+				return CheckStatusLength(st, clientProtocol, cfg.SoftwareSignature)
+			})
+			if err != nil {
+				t.Fatalf("CompilePingHook(%q) error: %v", ping, err)
+			}
+		}
+		if join != "" {
+			if server.JoinHook, err = scope.CompileJoinHook(join, testServerID, CheckKickLength); err != nil {
+				t.Fatalf("CompileJoinHook(%q) error: %v", join, err)
+			}
+		}
+	})
+}
+
+// countingUpstream is a fake upstream that counts the reads of its state.
+type countingUpstream struct {
+	fakeUpstream
+	reads *atomic.Int32
+}
+
+func (u countingUpstream) State() upstream.State {
+	u.reads.Add(1)
+	return u.fakeUpstream.State()
+}
+
+// Ping scripts answer statuses in place of the static and upstream ones, with
+// the client protocol that they choose, and are logged as their source.
+func TestPingHook(t *testing.T) {
+	live := mustParseStatus(t, `{"description":"Live","players":{"max":20,"online":3}}`)
+	cfg := withServer(testConfig, func(server *VirtualServer) { server.Upstream = "live" })
+	cfg = withHooks(t, cfg, []string{"live"}, `None if client.host == "plain" else {"status": fms.merge(server.status, {"players": {"online": 42}}), "client_protocol": "always"}`, "")
+	var logs bytes.Buffer
+	addr, stop := startServerWithUpstreams(t, cfg, map[string]Upstream{"live": fakeUpstream{live}}, slog.New(logging.NewTextHandler(&logs, nil)))
+
+	c := dial(t, addr)
+	got := c.statusExchange(777)
+	_ = c.conn.Close()
+	if want := `{"max":20,"online":42}`; string(got["players"]) != want || string(got["version"]) != `{"name":"","protocol":777}` {
+		t.Errorf("status = %s, want players %s and the version of the client", got, want)
+	}
+	c = dial(t, addr)
+	c.handshakeTo("plain", 777, modernproto.IntentStatus)
+	c.write(modernproto.AppendPacket(nil, modernproto.StatusRequestID, nil))
+	if got := c.readStatus()["description"]; string(got) != `"Live"` {
+		t.Errorf("description = %s, want the one of the upstream when the script returns None", got)
+	}
+	_ = c.conn.Close()
+	stop()
+	for _, want := range []string{" server=test source=script ", " server=test source=upstream "} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("logs = %q, want them to contain %q", logs.String(), want)
+		}
+	}
+}
+
+// Join scripts answer joins in place of the kick message, legacy logins too.
+func TestJoinHook(t *testing.T) {
+	cfg := withHooks(t, testConfig, nil, "", `{"kick": "Sorry " + fms.sanitize(client.username)} if client.username != "Steve" else None`)
+	var logs bytes.Buffer
+	addr, stop := startServerWithLogger(t, cfg, slog.New(logging.NewTextHandler(&logs, nil)))
+
+	c := dial(t, addr)
+	c.handshake(777, modernproto.IntentLogin)
+	c.write(modernproto.AppendPacket(nil, modernproto.LoginStartID, modernproto.AppendString(nil, "§cAlex")))
+	if got, want := c.readString(modernproto.LoginDisconnectID), `{"text":"Sorry Alex"}`; got != want {
+		t.Errorf("kick message = %s, want %s", got, want)
+	}
+	_ = c.conn.Close()
+	c = dial(t, addr)
+	c.handshake(777, modernproto.IntentLogin)
+	c.loginStart()
+	if got := c.readString(modernproto.LoginDisconnectID); got != testKick {
+		t.Errorf("kick message = %s, want the one of the server when the script returns None", got)
+	}
+	_ = c.conn.Close()
+	c = dial(t, addr)
+	c.write(legacyLogin13)
+	if got := c.readLegacyResponse(); got != "Sorry Notch" {
+		t.Errorf("legacy kick message = %q, want the one of the script", got)
+	}
+	_ = c.conn.Close()
+	stop()
+	if want := ` username="§cAlex" `; !strings.Contains(logs.String(), " server=test source=script "+strings.TrimPrefix(want, " ")) {
+		t.Errorf("logs = %q, want a join line with source=script", logs.String())
+	}
+}
+
+// A hook that fails is logged, with the fields of the client that it read, and
+// the server answers as without it.
+func TestHookFailures(t *testing.T) {
+	cfg := withHooks(t, testConfig, nil, `{"status": {"description": str(1 // (0 if client.host_extra == "x" else 1))}}`, `{"kick": "x" if client.username != "Steve" else client.username[5]}`)
+	var logs bytes.Buffer
+	addr, stop := startServerWithLogger(t, cfg, slog.New(logging.NewTextHandler(&logs, nil)))
+
+	c := dial(t, addr)
+	c.write(modernproto.AppendHandshake(nil, modernproto.Handshake{ProtocolVersion: 777, ServerAddress: "localhost", ServerAddressExtra: "x", Intent: modernproto.IntentStatus}))
+	c.write(modernproto.AppendPacket(nil, modernproto.StatusRequestID, nil))
+	if got := c.readStatus()["description"]; string(got) != `{"text":"Hello"}` {
+		t.Errorf("description = %s, want the static one", got)
+	}
+	_ = c.conn.Close()
+	c = dial(t, addr)
+	c.handshake(777, modernproto.IntentLogin)
+	c.loginStart()
+	if got := c.readString(modernproto.LoginDisconnectID); got != testKick {
+		t.Errorf("kick message = %s, want the one of the server", got)
+	}
+	_ = c.conn.Close()
+	stop()
+	for _, want := range []string{
+		`WARN  \[127\.0\.0\.1\]:\d+ ping script failed: server=test client\.host_extra="x" error="floored division by zero"`,
+		`WARN  \[127\.0\.0\.1\]:\d+ join script failed: server=test client\.username="Steve" error="string index 5 out of range \[-5:4\]"`,
+		`INFO  \S+ server list ping: .* server=test source=static `,
+	} {
+		if !regexp.MustCompile(`(?m)^\[\S+\] ` + want).MatchString(logs.String()) {
+			t.Errorf("logs = %q, want a line matching %q", logs.String(), want)
+		}
+	}
+}
+
+// Each request reads each upstream once, so that its conditions, its hooks
+// and its answer see the same state, and conditions can choose servers by the
+// state of upstreams.
+func TestUpstreamsReadOncePerRequest(t *testing.T) {
+	live := mustParseStatus(t, `{"description":"Live"}`)
+	reads := new(atomic.Int32)
+	cfg := withServer(testConfig, func(server *VirtualServer) { server.Upstream = "lobby" })
+	cfg = withHooks(t, cfg, []string{"lobby"}, `{"status": server.status} if ctx.upstream("lobby").status != None else None`, "")
+	cond, err := script.NewScope([]script.UpstreamInfo{{ID: "lobby"}}, nil).CompileCondition(`ctx.upstream("lobby").status != None`)
+	if err != nil {
+		t.Fatalf("CompileCondition() error: %v", err)
+	}
+	cfg.Servers["down"] = VirtualServer{Status: mustParseStatus(t, `{"description":"Down"}`), Kick: json.RawMessage(testKick)}
+	cfg.Rules = []Rule{{Name: "up", Conditions: []script.Condition{cond}, Server: testServerID}, {Name: "default", Server: "down"}}
+	upstreams := map[string]Upstream{"lobby": countingUpstream{fakeUpstream{live}, reads}}
+	addr, _ := startServerWithUpstreams(t, cfg, upstreams, slog.New(slog.DiscardHandler))
+
+	if got := dial(t, addr).statusExchange(777)["description"]; string(got) != `"Live"` {
+		t.Errorf("description = %s, want the one of the upstream", got)
+	}
+	if n := reads.Load(); n != 1 {
+		t.Errorf("upstream read %d times for one request, want once", n)
 	}
 }
