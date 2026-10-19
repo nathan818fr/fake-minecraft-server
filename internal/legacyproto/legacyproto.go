@@ -9,14 +9,11 @@
 package legacyproto
 
 import (
-	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
-	"strings"
 	"unicode/utf16"
 )
 
@@ -38,10 +35,12 @@ const maxUsernameLength = 16
 const unknownProtocolVersion = -1
 
 // AppendKick appends a kick packet holding s, which disconnects legacy
-// clients with s as message, cut to their length limit. Invalid UTF-8 is sent
-// as U+FFFD.
+// clients with s as message, cut to their length limit, without a "§" whose
+// code was cut. Invalid UTF-8 is sent as U+FFFD.
 func AppendKick(b []byte, s string) []byte {
-	s = shortenUTF16(s, maxKickLength)
+	if short := shortenUTF16(s, maxKickLength); len(short) < len(s) {
+		s = withoutCutCode(short)
+	}
 	b = append(b, kickID)
 	b = binary.BigEndian.AppendUint16(b, uint16(utf16Length(s)))
 	for _, r := range s {
@@ -92,54 +91,6 @@ func readString(r io.Reader, maxLength int) (string, error) {
 		return "", noEOF(err)
 	}
 	return string(utf16.Decode(units)), nil
-}
-
-// maxComponentDepth bounds the nesting of the components that are converted,
-// as each level decodes the rest of the component again: deeper components
-// have no text. Real components nest a few levels.
-const maxComponentDepth = 64
-
-// TextFromComponent converts a JSON text component to legacy text: its texts,
-// formatted with the § codes they contain, but without the styles defined in
-// JSON. Missing (nil) or invalid components have no text.
-func TextFromComponent(component json.RawMessage) string {
-	var b strings.Builder
-	appendComponentText(&b, component, 0)
-	return b.String()
-}
-
-// appendComponentText decodes component, at depth, once, as the kind its
-// first byte tells.
-func appendComponentText(b *strings.Builder, component json.RawMessage, depth int) {
-	component = bytes.TrimLeft(component, " \t\r\n")
-	if len(component) == 0 || depth > maxComponentDepth {
-		return
-	}
-	switch component[0] {
-	case '"':
-		var text string
-		if json.Unmarshal(component, &text) == nil {
-			b.WriteString(text)
-		}
-	case '[':
-		var list []json.RawMessage
-		if json.Unmarshal(component, &list) == nil {
-			for _, c := range list {
-				appendComponentText(b, c, depth+1)
-			}
-		}
-	case '{':
-		var object struct {
-			Text  string            `json:"text"`
-			Extra []json.RawMessage `json:"extra"`
-		}
-		if json.Unmarshal(component, &object) == nil {
-			b.WriteString(object.Text)
-			for _, c := range object.Extra {
-				appendComponentText(b, c, depth+1)
-			}
-		}
-	}
 }
 
 // readPort reads a port, sent as an int.

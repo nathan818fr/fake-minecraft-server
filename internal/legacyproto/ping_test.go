@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf16"
+
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/status"
 )
 
 func mustHex(t *testing.T, s string) []byte {
@@ -180,8 +182,17 @@ func kickText(packet []byte) string {
 	return string(utf16.Decode(units))
 }
 
-func TestMOTDFromComponent(t *testing.T) {
-	if got := MOTDFromComponent([]byte(`{"text":"§eFirst\n§dSecond"}`)); got != "§eFirst" {
-		t.Errorf("MOTDFromComponent() = %q, want the first line only", got)
+func TestMOTDFromValue(t *testing.T) {
+	for _, tc := range []struct{ component, want string }{
+		{`{"text":"§eFirst\n§dSecond"}`, "§eFirst"},
+		{`{"text":"Hub","color":"gold","extra":[{"text":"!","bold":true}]}`, "§6Hub§l!"},
+	} {
+		component, err := status.ParseValue([]byte(tc.component))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := MOTDFromValue(component); got != tc.want {
+			t.Errorf("MOTDFromValue(%s) = %q, want %q", tc.component, got, tc.want)
+		}
 	}
 }

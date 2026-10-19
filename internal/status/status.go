@@ -215,12 +215,9 @@ func (s *Status) Players() Players {
 	return p
 }
 
-// Description returns the MOTD of s, a JSON text component, or nil if it has
-// none.
-func (s *Status) Description() json.RawMessage {
-	description, ok := s.Get(descriptionPath)
-	if !ok {
-		return nil
-	}
-	return AppendValue(nil, description)
+// Description returns the MOTD of s, a text component as Object values hold
+// it, or nil if it has none.
+func (s *Status) Description() any {
+	description, _ := s.Get(descriptionPath)
+	return description
 }

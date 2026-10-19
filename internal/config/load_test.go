@@ -55,7 +55,7 @@ func TestVariables(t *testing.T) {
 
 func TestVariableValues(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "icon.png"), pngSignature, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "icon.png"), testIcon, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	// The favicons of variables are relative to the working directory.
@@ -97,7 +97,7 @@ func TestVariableValues(t *testing.T) {
 		t.Errorf("logFormat = %q, logLevel = %v, want json and DEBUG", cfg.LogFormat, cfg.LogLevel)
 	}
 	// The status of a variable is the whole status, as in the file.
-	want := `{"description":"Hello","favicon":"data:image/png;base64,iVBORw0KGgo=",` +
+	want := `{"description":"Hello","favicon":"` + testFavicon + `",` +
 		`"players":{"max":100,"online":2}}`
 	if got := statusJSON(t, cfg, "default"); got != want {
 		t.Errorf("default status = %s, want %s", got, want)
@@ -217,7 +217,7 @@ rules: [{ server: lobby }, { server: default }]
 		t.Errorf("lobby server = %+v, want the kick message of the file", vs)
 	}
 
-	want := `{"description":"Hello","favicon":"data:image/png;base64,iVBORw0KGgo=",` +
+	want := `{"description":"Hello","favicon":"` + testFavicon + `",` +
 		`"players":{"max":100,"online":5},"version":{"name":"Fake","protocol":773}}`
 	if got := statusJSON(t, cfg, "default"); got != want {
 		t.Errorf("default status = %s, want %s", got, want)

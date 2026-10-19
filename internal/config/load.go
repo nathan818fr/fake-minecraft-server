@@ -49,16 +49,20 @@ func Load(environ []string) (Config, error) {
 
 	var s settings
 	var errs []error
+	// scriptDir is where the paths of a script written in the settings are
+	// relative to: the working directory, unless it is in the file.
+	var scriptDir string
 	if path := env[envConfigFile]; path != "" {
 		for _, err := range readConfigFile(path, &s) {
 			errs = append(errs, fmt.Errorf("%s: %w", envConfigFile, err))
 		}
-		s.resolvePaths(filepath.Dir(path))
+		scriptDir = filepath.Dir(path)
+		s.resolvePaths(scriptDir)
 	}
 	s.addDefaultServer()
 	// Either variable replaces the script of the file, whichever form it has.
 	if env[envScript] != "" || env[envScriptFile] != "" {
-		s.Script, s.ScriptFile = "", ""
+		s.Script, s.ScriptFile, scriptDir = "", "", ""
 	}
 	for _, v := range variables(&s, env) {
 		for _, err := range v.apply() {
@@ -70,7 +74,7 @@ func Load(environ []string) (Config, error) {
 		s.ScriptFile = "" // Reported once, here.
 	}
 
-	cfg, checkErrs := s.check()
+	cfg, checkErrs := s.check(scriptDir)
 	return cfg, errors.Join(append(errs, checkErrs...)...)
 }
 

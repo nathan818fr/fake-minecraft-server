@@ -1,6 +1,11 @@
 package script
 
 import (
+	"bytes"
+	"encoding/base64"
+	"image"
+	"image/png"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -30,7 +35,7 @@ def depth(n):
     return 0 if n == 0 else 1 + depth(n - 1)
 
 print("loaded", len(PORTS))
-`)
+`, "")
 	if err != nil {
 		t.Fatalf("LoadModule() error: %v", err)
 	}
@@ -67,7 +72,7 @@ func TestLoadModuleErrors(t *testing.T) {
 		{"X = (\n", "2:1: got end of file, want primary expression"},
 	}
 	for _, tc := range tests {
-		if err := NewScope(nil, nil).LoadModule(tc.src); err == nil || err.Error() != tc.want {
+		if err := NewScope(nil, nil).LoadModule(tc.src, ""); err == nil || err.Error() != tc.want {
 			t.Errorf("LoadModule(%q) error = %v, want %s", tc.src, err, tc.want)
 		}
 	}
@@ -76,7 +81,7 @@ func TestLoadModuleErrors(t *testing.T) {
 // The names of a module that failed to load are not reported as typos.
 func TestModuleFailed(t *testing.T) {
 	s := NewScope(nil, nil)
-	if err := s.LoadModule("def is_staff(client):\n    return (\n"); err == nil {
+	if err := s.LoadModule("def is_staff(client):\n    return (\n", ""); err == nil {
 		t.Fatal("LoadModule() succeeded, want an error")
 	}
 	if _, err := s.CompileCondition(`is_staff(client)`); err == nil || err.Error() != "1:1: undefined: is_staff (the script failed to load)" {
@@ -94,7 +99,7 @@ func TestModuleFailed(t *testing.T) {
 
 	// What it printed before failing is kept, as it may tell why.
 	s = NewScope(nil, nil)
-	if err := s.LoadModule("print(\"loading\")\nX = 1 // 0\n"); err == nil {
+	if err := s.LoadModule("print(\"loading\")\nX = 1 // 0\n", ""); err == nil {
 		t.Fatal("LoadModule() succeeded, want an error")
 	}
 	if want := []string{"loading"}; !slices.Equal(s.Prints(), want) {
@@ -105,7 +110,7 @@ func TestModuleFailed(t *testing.T) {
 // The top level of a module has a larger budget than each evaluation.
 func TestLoadModuleSteps(t *testing.T) {
 	s := NewScope(nil, nil)
-	if err := s.LoadModule("TABLE = {i: i * i for i in range(20000)}\ndef square(n):\n    return TABLE[n]\n"); err != nil {
+	if err := s.LoadModule("TABLE = {i: i * i for i in range(20000)}\ndef square(n):\n    return TABLE[n]\n", ""); err != nil {
 		t.Fatalf("LoadModule() error: %v", err)
 	}
 	if _, err := s.CompileCondition(`square(client.port % 1000) >= 0`); err != nil {
@@ -116,7 +121,7 @@ func TestLoadModuleSteps(t *testing.T) {
 // What conditions print during a request goes to the printer of Match.
 func TestRequestPrint(t *testing.T) {
 	s := NewScope(nil, nil)
-	if err := s.LoadModule("def log(client):\n    print(\"from\", client.ip)\n    return True\n"); err != nil {
+	if err := s.LoadModule("def log(client):\n    print(\"from\", client.ip)\n    return True\n", ""); err != nil {
 		t.Fatalf("LoadModule() error: %v", err)
 	}
 	c, err := s.CompileCondition(`log(client)`)
@@ -130,6 +135,40 @@ func TestRequestPrint(t *testing.T) {
 	}
 	if want := []string{"from 10.1.2.3"}; !slices.Equal(printed, want) {
 		t.Errorf("printed %q, want %q", printed, want)
+	}
+}
+
+// Favicons are read while the module loads, relative to its directory, and
+// never during requests.
+func TestReadFavicon(t *testing.T) {
+	dir := t.TempDir()
+	var icon bytes.Buffer
+	if err := png.Encode(&icon, image.NewGray(image.Rect(0, 0, 64, 64))); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "icon.png"), icon.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := NewScope(nil, nil)
+	if err := s.LoadModule("ICON = fms.read_favicon(\"icon.png\")\ndef icon():\n    return fms.read_favicon(\"icon.png\")\n", dir); err != nil {
+		t.Fatalf("LoadModule() error: %v", err)
+	}
+	if _, err := s.CompileCondition(`ICON == "data:image/png;base64,` + base64.StdEncoding.EncodeToString(icon.Bytes()) + `"`); err != nil {
+		t.Errorf("CompileCondition() error: %v", err)
+	}
+
+	tests := []struct{ src, want string }{
+		{`fms.read_favicon("icon.png") != ""`, "1:1: fms.read_favicon: only works while the script loads: keep favicons in globals"},
+		{`icon() != ""`, "fails for a modern ping: fms.read_favicon: only works while the script loads: keep favicons in globals"},
+	}
+	for _, tc := range tests {
+		if _, err := s.CompileCondition(tc.src); err == nil || err.Error() != tc.want {
+			t.Errorf("CompileCondition(%s) error = %v, want %s", tc.src, err, tc.want)
+		}
+	}
+	err := NewScope(nil, nil).LoadModule("X = 1\nICON = fms.read_favicon(\"missing.png\")\n", dir)
+	if want := "2:24: fms.read_favicon: open " + filepath.Join(dir, "missing.png") + ": no such file or directory"; err == nil || err.Error() != want {
+		t.Errorf("LoadModule() error = %v, want %s", err, want)
 	}
 }
 

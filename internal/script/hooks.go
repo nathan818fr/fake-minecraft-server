@@ -205,9 +205,11 @@ func (h *PingHook) answer(result starlark.Value) (*PingAnswer, error) {
 		return nil, fmt.Errorf(`"status" must be a dict, got %s`, value.Type())
 	}
 	if favicon, found, _ := fields.Get(starlark.String("favicon")); found {
-		// A favicon read from a file in each request would be costly.
-		if text, ok := favicon.(starlark.String); !ok || !strings.HasPrefix(string(text), "data:") {
-			return nil, fmt.Errorf(`"status": favicon must be a data URI ("data:image/png;base64,..."), got %s`, favicon)
+		// Not a file, which would be read at each request, nor another format,
+		// which clients ignore. Its size is not checked: hooks may pass on the
+		// favicon of an upstream, whatever its size.
+		if text, ok := favicon.(starlark.String); !ok || !strings.HasPrefix(string(text), status.FaviconPrefix) {
+			return nil, fmt.Errorf(`"status": favicon must be a PNG data URI (%q...), got %s`, status.FaviconPrefix, favicon)
 		}
 	}
 	converted, err := toJSON(fields, 0)

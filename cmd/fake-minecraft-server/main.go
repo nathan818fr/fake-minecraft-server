@@ -11,6 +11,10 @@ import (
 	"runtime/debug"
 	"syscall"
 
+	// Scripts can use time zones, such as "Europe/Paris", where the system
+	// has no time zone database, as in the image.
+	_ "time/tzdata"
+
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/config"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/logging"
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/server"

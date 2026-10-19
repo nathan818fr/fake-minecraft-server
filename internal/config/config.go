@@ -6,9 +6,7 @@
 package config
 
 import (
-	"bytes"
 	"cmp"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,7 +15,6 @@ import (
 	"math"
 	"net"
 	"net/netip"
-	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -234,8 +231,9 @@ func (c *checker) failf(key, format string, args ...any) {
 }
 
 // check checks the settings, and returns the configuration they make, with
-// the defaults of the unset ones.
-func (s *settings) check() (Config, []error) {
+// the defaults of the unset ones. The paths that the script reads are relative
+// to scriptDir, or to the file of script_file.
+func (s *settings) check(scriptDir string) (Config, []error) {
 	var c checker
 	var cfg Config
 	cfg.Listeners = c.listeners(s.Listen)
@@ -255,7 +253,7 @@ func (s *settings) check() (Config, []error) {
 	cfg.Server.SoftwareSignature = !s.NoSoftwareSignature
 	cfg.Server.Servers = c.servers(s.Servers, s.Upstreams, cfg.Server.SoftwareSignature)
 	scope := newScope(cfg.Server.Upstreams, cfg.Server.Servers)
-	c.module(scope, s.Script, s.ScriptFile)
+	c.module(scope, s.Script, s.ScriptFile, scriptDir)
 	cfg.ScriptPrints = scope.Prints()
 	c.hooks(scope, s.Servers, cfg.Server.Servers, cfg.Server.SoftwareSignature)
 	cfg.Server.Rules = c.rules(s.Rules, cfg.Server.Servers, scope)
@@ -670,8 +668,9 @@ func (c *checker) rules(entries []ruleSettings, servers map[string]server.Virtua
 }
 
 // module loads the script module of scope, written in src or in the file at
-// path, if either is set.
-func (c *checker) module(scope *script.Scope, src, path string) {
+// path, if either is set. The paths that src reads are relative to dir, and
+// the ones that the file reads to its directory.
+func (c *checker) module(scope *script.Scope, src, path, dir string) {
 	switch {
 	case src != "" && path != "":
 		c.failf("script_file", "cannot be set together with script")
@@ -680,7 +679,7 @@ func (c *checker) module(scope *script.Scope, src, path string) {
 			c.fail("script_file", err)
 		}
 	case src != "":
-		if err := scope.LoadModule(src); err != nil {
+		if err := scope.LoadModule(src, dir); err != nil {
 			c.fail("script", err)
 		}
 	}
@@ -778,20 +777,11 @@ func jsonComponent(text string) (json.RawMessage, error) {
 // faviconDataPrefix starts the favicons that are data URIs rather than paths.
 const faviconDataPrefix = "data:"
 
-var pngSignature = []byte("\x89PNG\r\n\x1a\n")
-
-// loadFavicon returns value as is if it is already a data URI, and otherwise
-// reads the PNG file it points to.
+// loadFavicon checks value if it is already a data URI, and otherwise reads
+// the PNG file it points to.
 func loadFavicon(value string) (string, error) {
 	if strings.HasPrefix(value, faviconDataPrefix) {
-		return value, nil
+		return value, status.CheckFavicon(value)
 	}
-	data, err := os.ReadFile(value)
-	if err != nil {
-		return "", err
-	}
-	if !bytes.HasPrefix(data, pngSignature) {
-		return "", fmt.Errorf("%s is not a PNG file", value)
-	}
-	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(data), nil
+	return status.ReadFavicon(value)
 }

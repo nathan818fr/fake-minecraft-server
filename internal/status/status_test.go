@@ -50,7 +50,7 @@ func TestParse(t *testing.T) {
 	if got, want := s.Players(), (Players{Max: 100, Online: 3}); got != want {
 		t.Errorf("Players() = %+v, want %+v", got, want)
 	}
-	if got, want := string(s.Description()), `{"text":"Hello"}`; got != want {
+	if got, want := string(AppendValue(nil, s.Description())), `{"text":"Hello"}`; got != want {
 		t.Errorf("Description() = %s, want %s", got, want)
 	}
 }
@@ -77,7 +77,7 @@ func TestNew(t *testing.T) {
 func TestParseWithoutKnownFields(t *testing.T) {
 	s := mustParse(t, `{"custom":1}`)
 	if s.Version() != (Version{}) || s.Players() != (Players{}) || s.Description() != nil {
-		t.Errorf("Version() = %+v, Players() = %+v, Description() = %s, want zero values", s.Version(), s.Players(), s.Description())
+		t.Errorf("Version() = %+v, Players() = %+v, Description() = %v, want zero values", s.Version(), s.Players(), s.Description())
 	}
 }
 

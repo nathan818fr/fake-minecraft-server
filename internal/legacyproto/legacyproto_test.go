@@ -14,6 +14,11 @@ func TestAppendKick(t *testing.T) {
 	if length := int(kick[1])<<8 | int(kick[2]); length != maxKickLength || len(kick) != 3+2*length {
 		t.Errorf("kick of %d code units in %d bytes, want %d code units", length, len(kick), maxKickLength)
 	}
+	// Cut between "§" and its code, the "§" goes too.
+	kick = AppendKick(nil, strings.Repeat("a", maxKickLength-1)+"§c")
+	if length := int(kick[1])<<8 | int(kick[2]); length != maxKickLength-1 {
+		t.Errorf("kick of %d code units, want %d, without the cut code", length, maxKickLength-1)
+	}
 }
 
 // Text cut to the length limit must not end with half of a surrogate pair.
@@ -21,40 +26,6 @@ func TestShortenUTF16(t *testing.T) {
 	for _, maxLength := range []int{4, 5} {
 		if got := shortenUTF16("😀😀😀", maxLength); got != "😀😀" {
 			t.Errorf("shortenUTF16(%d) = %q, want %q", maxLength, got, "😀😀")
-		}
-	}
-}
-
-// Components nested deeper than maxComponentDepth have no text, so that
-// statuses made to be costly to convert are not.
-func TestTextFromComponentDepth(t *testing.T) {
-	nested := func(depth int) []byte {
-		return []byte(strings.Repeat("[", depth) + `"x"` + strings.Repeat("]", depth))
-	}
-	if got := TextFromComponent(nested(maxComponentDepth)); got != "x" {
-		t.Errorf("TextFromComponent() at the maximum depth = %q, want %q", got, "x")
-	}
-	if got := TextFromComponent(nested(maxComponentDepth + 1)); got != "" {
-		t.Errorf("TextFromComponent() deeper = %q, want no text", got)
-	}
-}
-
-func TestTextFromComponent(t *testing.T) {
-	tests := []struct {
-		component string
-		want      string
-	}{
-		{`{"text":"§eHello\n§dWorld"}`, "§eHello\n§dWorld"},
-		{`{"text":"A","extra":[{"text":"B","bold":true},"C",["D"]]}`, "ABCD"},
-		{`"plain"`, "plain"},
-		{" \n" + `{"text":"spaced"}`, "spaced"},
-		{`{"text":"invalid"`, ""},
-		{`42`, ""},
-		{``, ""},
-	}
-	for _, tc := range tests {
-		if got := TextFromComponent([]byte(tc.component)); got != tc.want {
-			t.Errorf("TextFromComponent(%s) = %q, want %q", tc.component, got, tc.want)
 		}
 	}
 }

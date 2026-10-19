@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"unicode/utf8"
 	"unsafe"
 
 	"go.starlark.net/starlark"
@@ -262,47 +261,4 @@ func merge(target, patch starlark.Value, depth int) (starlark.Value, error) {
 		}
 	}
 	return merged, nil
-}
-
-// stripFormatting removes the formatting codes of Minecraft from s: "§" and
-// the character after it, whatever it is, as the client reads them, so that
-// no "§" is left.
-func stripFormatting(s string) string {
-	var b strings.Builder
-	skip := false
-	for _, r := range s {
-		switch {
-		case skip:
-			skip = false
-		case r == '§':
-			skip = true
-		default:
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
-// sanitize implements fms.sanitize: the codes first, so that "§" takes the
-// invisible character after it, rather than the next visible one.
-func sanitize(text string) string {
-	return stripInvisible(stripFormatting(text))
-}
-
-// stripInvisible removes from s the characters that logs escape: line breaks,
-// tabs, other control characters, zero-width and bidirectional characters,
-// and invalid UTF-8.
-func stripInvisible(s string) string {
-	var b strings.Builder
-	for i, r := range s {
-		if r == utf8.RuneError {
-			if _, size := utf8.DecodeRuneInString(s[i:]); size == 1 {
-				continue
-			}
-		}
-		if strconv.IsPrint(r) {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
 }

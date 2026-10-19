@@ -121,7 +121,7 @@ func legacyStatus(st *status.Status) legacyproto.Status {
 	return legacyproto.Status{
 		ProtocolVersion: version.Protocol,
 		VersionName:     version.Name,
-		MOTD:            legacyproto.MOTDFromComponent(st.Description()),
+		MOTD:            legacyproto.MOTDFromValue(st.Description()),
 		OnlinePlayers:   players.Online,
 		MaxPlayers:      players.Max,
 	}
