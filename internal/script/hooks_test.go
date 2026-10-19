@@ -1,8 +1,13 @@
 package script
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"image"
+	"image/png"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -114,19 +119,31 @@ func TestPingHook(t *testing.T) {
 	}
 }
 
-// A ping hook that returns unchanged the favicon of a status reuses its JSON
-// rather than encoding it again at each ping.
+// A ping hook that returns unchanged the favicon of a status, or one that the
+// module read, reuses its JSON rather than encoding it again at each ping.
 func TestPingHookFavicons(t *testing.T) {
+	dir := t.TempDir()
+	var icon bytes.Buffer
+	if err := png.Encode(&icon, image.NewGray(image.Rect(0, 0, 64, 64))); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "icon.png"), icon.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	static := mustParseStatus(t, `{"favicon":"data:image/png;base64,c3RhdGlj"}`)
 	live := mustParseStatus(t, `{"favicon":"data:image/png;base64,bGl2ZQ=="}`)
 	s := NewScope([]UpstreamInfo{{ID: "survival"}}, []ServerInfo{{ID: "lobby", StaticStatus: static, Upstream: "survival"}})
+	if err := s.LoadModule(`ICON = fms.read_favicon("icon.png")`, dir); err != nil {
+		t.Fatalf("LoadModule() error: %v", err)
+	}
 	tests := []struct {
 		src    string
 		reused bool
 	}{
 		{`server.static_status["favicon"]`, true},
 		// The sample status of upstreams has no favicon.
-		{`server.status.get("favicon", "data:")`, true},
+		{`server.status.get("favicon", server.static_status["favicon"])`, true},
+		{`ICON`, true},
 		{`"data:image/png;base64," + "bmV3"`, false},
 	}
 	for _, tc := range tests {
@@ -183,7 +200,8 @@ func TestHookErrors(t *testing.T) {
 		{`{"status": "x"}`, `fails for a modern ping: "status" must be a dict, got string`},
 		{`{"client_protocol": "never"}`, `fails for a modern ping: the result has no "status"`},
 		{`{"status": {}, "client_protocol": "sometimes"}`, `fails for a modern ping: "client_protocol" must be "auto", "always" or "never", got "sometimes"`},
-		{`{"status": {"favicon": "icon.png"}}`, `fails for a modern ping: "status": favicon must be a data URI ("data:image/png;base64,..."), got "icon.png"`},
+		{`{"status": {"favicon": "icon.png"}}`, `fails for a modern ping: "status": favicon must be a PNG data URI ("data:image/png;base64,"...), got "icon.png"`},
+		{`{"status": {"favicon": "data:image/jpeg;base64,AAAA"}}`, `fails for a modern ping: "status": favicon must be a PNG data URI ("data:image/png;base64,"...), got "data:image/jpeg;base64,AAAA"`},
 		{`{"status": {"players": {"max": "many"}}}`, `fails for a modern ping: "status": players.max: must be an integer between -2147483648 and 2147483647, got "many"`},
 		{`{"status": fms.merge(server.status, {"players": {"online": ctx.upstream("survival").status["players"]["online"]}})}`, `fails for a modern ping, with the upstreams unavailable: unhandled index operation NoneType[string]`},
 	}
@@ -220,11 +238,11 @@ func TestUpstreamMethod(t *testing.T) {
 	}
 
 	// Upstreams change with requests, and the module runs once, without ctx.
-	if err := testScope(t).LoadModule(`X = ctx.upstream("survival")`); err == nil || err.Error() != "1:5: undefined: ctx" {
+	if err := testScope(t).LoadModule(`X = ctx.upstream("survival")`, ""); err == nil || err.Error() != "1:5: undefined: ctx" {
 		t.Errorf("LoadModule() error = %v, want ctx undefined", err)
 	}
-	if err := testScope(t).LoadModule("def f(ctx):\n    return ctx.upstreams(\"survival\")\n"); err == nil ||
-		err.Error() != "2:16: ctx has no .upstreams field or method (did you mean .upstream?)" {
+	if err := testScope(t).LoadModule("def f(ctx):\n    return ctx.servrs()\n", ""); err == nil ||
+		err.Error() != "2:16: ctx has no .servrs field or method (did you mean .servers?)" {
 		t.Errorf("LoadModule() error = %v, want the method that does not exist", err)
 	}
 }
@@ -233,8 +251,9 @@ func TestUpstreamMethod(t *testing.T) {
 // type, a short form, and their attributes.
 func TestObjects(t *testing.T) {
 	c, err := testScope(t).CompileCondition(`type(client) == "client" and str(client).startswith('client(request = "ping", transferred = False, ')` +
-		` and type(ctx) == "ctx" and str(ctx) == "ctx" and dir(ctx) == ["server", "upstream"]` +
-		` and str(ctx.server("lobby")) == 'server(id = "lobby")' and dir(ctx.server("lobby")) == ["id", "kick", "static_status", "status", "upstream"]`)
+		` and type(ctx) == "ctx" and str(ctx) == "ctx" and dir(ctx) == ["choice", "now", "randint", "random", "server", "servers", "upstream", "upstreams"]` +
+		` and str(ctx.server("lobby")) == 'server(id = "lobby")' and dir(ctx.server("lobby")) == ["id", "kick", "static_status", "status", "upstream"]` +
+		` and str(ctx.upstream("survival")) == 'upstream(id = "survival")' and dir(ctx.upstream("survival")) == ["address", "age_ms", "id", "latency_ms", "status"]`)
 	if err != nil {
 		t.Fatalf("CompileCondition() error: %v", err)
 	}

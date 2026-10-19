@@ -51,32 +51,6 @@ func TestMerge(t *testing.T) {
 	}
 }
 
-func TestTextFunctions(t *testing.T) {
-	tests := []struct {
-		fn   func(string) string
-		in   string
-		want string
-	}{
-		{stripFormatting, "§cRed §lbold§r", "Red bold"},
-		{stripFormatting, "a§§bc§", "abc"},
-		{stripFormatting, "100%§", "100%"},
-		{stripInvisible, "a\nb\tc\x00d\u202ee\u200bf\xffg", "abcdefg"},
-		{stripInvisible, "§cNotch é 名前", "§cNotch é 名前"},
-	}
-	for _, tc := range tests {
-		if got := tc.fn(tc.in); got != tc.want {
-			t.Errorf("%q: got %q, want %q", tc.in, got, tc.want)
-		}
-	}
-	c, err := NewScope(nil, nil).CompileCondition(`fms.sanitize("§c§\nNotch\u202e") == "Notch"`)
-	if err != nil {
-		t.Fatalf("CompileCondition() error: %v", err)
-	}
-	if got, err := c.Match(&Request{Client: &sampleBase}, nil); err != nil || !got {
-		t.Errorf("Match() = %v, %v, want true", got, err)
-	}
-}
-
 // A patch that holds itself fails, rather than recursing until the stack
 // overflows, which would crash the server.
 func TestMergeLooped(t *testing.T) {

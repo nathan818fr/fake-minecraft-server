@@ -12,8 +12,10 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math/rand/v2"
 	"slices"
 	"strings"
+	"time"
 
 	"go.starlark.net/resolve"
 	"go.starlark.net/starlark"
@@ -30,9 +32,16 @@ type Request struct {
 	// each call during the request, so that every script of the request sees
 	// the same one. If nil, no upstream is available.
 	Upstream func(id string) upstream.State
+	// Now returns the current time, and Rand is the source of the random
+	// numbers of scripts, so that tests can fix them. If nil, they are the
+	// clock and a random source.
+	Now  func() time.Time
+	Rand *rand.Rand
 
-	// ctx is the ctx variable of the request, made when first needed.
+	// ctx is the ctx variable of the request, made when first needed, and now
+	// the time of the request, read when first needed.
 	ctx *ctxValue
+	now time.Time
 }
 
 // upstreamState returns the state of the upstream with the ID id during req.
@@ -76,7 +85,7 @@ func (s *Scope) compileExpr(src string, params ...string) (*starlark.Function, e
 	if err := checkFields(expr, lineOffset, params); err != nil {
 		return nil, err
 	}
-	if err := s.checkLiterals(expr, lineOffset); err != nil {
+	if err := s.checkLiterals(expr, lineOffset, false); err != nil {
 		return nil, err
 	}
 
@@ -219,12 +228,14 @@ func positioned(err error, lines int32) error {
 
 // callCheck is what checkLiterals checks at startup in the calls to a
 // function of fms or a method of ctx, so that mistakes are reported then, even
-// in a branch that no sample client takes: the literal strings given as the
-// argument at index arg, or as every argument but the first if arg is
-// argsAfterFirst.
+// in a branch that no sample client takes.
 type callCheck struct {
+	// literal checks the literal strings given as the argument at index arg,
+	// or as every argument but the first if arg is argsAfterFirst.
 	arg     int
 	literal func(s *Scope, text string) error
+	// outsideModule, if set, is the error of the calls outside the module.
+	outsideModule error
 }
 
 // argsAfterFirst is the callCheck.arg of the functions that take a value, then
@@ -234,10 +245,14 @@ const argsAfterFirst = -1
 // checksArg reports whether c checks the literal given as the argument at
 // index i.
 func (c callCheck) checksArg(i int) bool {
-	if c.arg == argsAfterFirst {
+	switch {
+	case c.literal == nil:
+		return false
+	case c.arg == argsAfterFirst:
 		return i > 0
+	default:
+		return i == c.arg
 	}
-	return i == c.arg
 }
 
 // checkedCall returns the name of the function of fms or the method of ctx
@@ -265,8 +280,9 @@ func checkedCall(fn syntax.Expr) (string, callCheck, bool) {
 }
 
 // checkLiterals checks the calls to the functions of fms and to the methods of
-// ctx in n (see callCheck). The positions of n are lineOffset lines down.
-func (s *Scope) checkLiterals(n syntax.Node, lineOffset int32) error {
+// ctx in n (see callCheck), in a module if inModule. The positions of n are
+// lineOffset lines down.
+func (s *Scope) checkLiterals(n syntax.Node, lineOffset int32, inModule bool) error {
 	var err error
 	syntax.Walk(n, func(n syntax.Node) bool {
 		if err != nil {
@@ -279,6 +295,11 @@ func (s *Scope) checkLiterals(n syntax.Node, lineOffset int32) error {
 		fn, check, ok := checkedCall(call.Fn)
 		if !ok {
 			return true
+		}
+		if check.outsideModule != nil && !inModule {
+			pos, _ := call.Span()
+			err = fmt.Errorf("%d:%d: %w", pos.Line-lineOffset, pos.Col, check.outsideModule)
+			return false
 		}
 		for i, arg := range call.Args {
 			if !check.checksArg(i) {

@@ -1,6 +1,8 @@
 package script
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"net/netip"
 	"regexp"
@@ -8,32 +10,35 @@ import (
 
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
+
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/legacyproto"
 )
 
 // fmsModule returns the fms module, which holds the native functions of
-// scripts, all pure, so that they work anywhere, and under a name of their own,
-// so that they never clash with the ones of scripts.
+// scripts, all pure, so that they work anywhere (but fms.read_favicon, which
+// only works while the module loads), and under a name of their own, so that
+// they never clash with the ones of scripts.
 func fmsModule() *starlarkstruct.Module {
-	return &starlarkstruct.Module{Name: "fms", Members: starlark.StringDict{
+	members := starlark.StringDict{
 		"match_host":      starlark.NewBuiltin("fms.match_host", matchHostBuiltin),
 		"in_network":      starlark.NewBuiltin("fms.in_network", inNetworkBuiltin),
 		"matches":         starlark.NewBuiltin("fms.matches", matchesBuiltin),
+		"bucket":          starlark.NewBuiltin("fms.bucket", bucketBuiltin),
 		"merge":           starlark.NewBuiltin("fms.merge", mergeBuiltin),
 		"strip_invisible": newTextBuiltin("fms.strip_invisible", stripInvisible),
 		"sanitize":        newTextBuiltin("fms.sanitize", sanitize),
-	}}
-}
-
-// newTextBuiltin returns the function name, which returns the text it is given
-// transformed by transform.
-func newTextBuiltin(name string, transform func(string) string) *starlark.Builtin {
-	return starlark.NewBuiltin(name, func(_ *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-		var text string
-		if err := starlark.UnpackPositionalArgs(b.Name(), args, kwargs, 1, &text); err != nil {
-			return nil, err
-		}
-		return starlark.String(transform(text)), nil
-	})
+		"to_legacy":       newComponentBuiltin("fms.to_legacy", legacyproto.TextFromValue),
+		"plain_text":      newComponentBuiltin("fms.plain_text", plainText),
+		"from_legacy":     starlark.NewBuiltin("fms.from_legacy", fromLegacyBuiltin),
+		"format_number":   starlark.NewBuiltin("fms.format_number", formatNumberBuiltin),
+		"split_duration":  starlark.NewBuiltin("fms.split_duration", splitDurationBuiltin),
+		"read_favicon":    starlark.NewBuiltin("fms.read_favicon", readFaviconBuiltin),
+		"from_timestamp":  starlark.NewBuiltin("fms.from_timestamp", fromTimestampBuiltin),
+	}
+	for _, name := range timeFunctions {
+		members[name] = newTimeBuiltin(name)
+	}
+	return &starlarkstruct.Module{Name: "fms", Members: members}
 }
 
 // fmsCallChecks are the checks of the calls to the functions of fms (see
@@ -52,6 +57,7 @@ var fmsCallChecks = map[string]callCheck{
 		_, err := compilePattern(text, true)
 		return err
 	}},
+	"read_favicon": {outsideModule: errReadFaviconAfterLoad},
 }
 
 // matchHostBuiltin implements fms.match_host(host, *patterns), which matches
@@ -157,6 +163,25 @@ func compilePattern(pattern string, literal bool) (*regexp.Regexp, error) {
 	}
 	c.others[pattern] = re
 	return re, nil
+}
+
+// bucketBuiltin implements fms.bucket(value, n), the bucket of value among n,
+// from 0 to n - 1: the same for a value across requests, restarts and
+// versions, and spread evenly. SHA-256, not hash, which is Java's
+// String.hashCode: with n = 2, the bucket of hash("a:" + s) follows from the
+// one of hash(s), so that two splits named by a prefix would pick the same
+// clients.
+func bucketBuiltin(_ *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var value string
+	var n int
+	if err := starlark.UnpackPositionalArgs(b.Name(), args, kwargs, 2, &value, &n); err != nil {
+		return nil, err
+	}
+	if n < 1 {
+		return nil, fmt.Errorf("%s: n must be at least 1, got %d", b.Name(), n)
+	}
+	sum := sha256.Sum256([]byte(value))
+	return starlark.MakeUint64(binary.BigEndian.Uint64(sum[:8]) % uint64(n)), nil
 }
 
 // unpackStrings unpacks the arguments of a function that takes a string, then

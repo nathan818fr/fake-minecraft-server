@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -178,7 +177,7 @@ func AppendPingResponse(b []byte, version PingVersion, s Status) []byte {
 	if version == PingBeta {
 		// Fields are separated by §, so the MOTD cannot have formatting codes.
 		tail := "§" + online + "§" + maxPlayers
-		motd := shortenUTF16(stripFormatting(s.MOTD), maxKickLength-utf16Length(tail))
+		motd := shortenUTF16(StripFormatting(s.MOTD), maxKickLength-utf16Length(tail))
 		return AppendKick(b, motd+tail)
 	}
 	head := pingResponsePrefix + "\x00" + strconv.Itoa(int(s.ProtocolVersion)) + "\x00"
@@ -187,30 +186,15 @@ func AppendPingResponse(b []byte, version PingVersion, s Status) []byte {
 	// The version name, which clients show in place of the player counts of
 	// incompatible servers (such as "§cMaintenance"), keeps up to half of the
 	// room, or what the MOTD leaves.
-	versionName := shortenUTF16(s.VersionName, max(room/2, room-utf16Length(s.MOTD)))
-	motd := shortenUTF16(s.MOTD, room-utf16Length(versionName))
+	versionName := withoutCutCode(shortenUTF16(s.VersionName, max(room/2, room-utf16Length(s.MOTD))))
+	motd := withoutCutCode(shortenUTF16(s.MOTD, room-utf16Length(versionName)))
 	return AppendKick(b, head+versionName+"\x00"+motd+tail)
 }
 
-// MOTDFromComponent converts a modern MOTD, a JSON text component, to the
+// MOTDFromValue converts a modern MOTD, a text component decoded like the
+// values of a status.Object, to the
 // legacy text shown in legacy server lists: only its first line.
-func MOTDFromComponent(component json.RawMessage) string {
-	line, _, _ := strings.Cut(TextFromComponent(component), "\n")
+func MOTDFromValue(component any) string {
+	line, _, _ := strings.Cut(TextFromValue(component), "\n")
 	return line
-}
-
-func stripFormatting(s string) string {
-	var b strings.Builder
-	skip := false
-	for _, r := range s {
-		switch {
-		case skip:
-			skip = false
-		case r == '§':
-			skip = true
-		default:
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
 }

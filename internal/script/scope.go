@@ -2,9 +2,10 @@ package script
 
 import (
 	"encoding/json"
+	"maps"
+	"slices"
 
 	"go.starlark.net/starlark"
-	"go.starlark.net/starlarkstruct"
 
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/status"
 )
@@ -41,9 +42,13 @@ type Scope struct {
 	// prints are what the top level of its module printed (see Prints).
 	prints    []string
 	upstreams map[string]*scopeUpstream
-	servers   map[string]*scopeServer
-	// favicons are the favicons of the static statuses, which do not change
-	// (see encodedFavicon).
+	// upstreamList and serverList hold them sorted by ID, for ctx.upstreams
+	// and ctx.servers.
+	upstreamList []*scopeUpstream
+	servers      map[string]*scopeServer
+	serverList   []*scopeServer
+	// favicons are the favicons of the static statuses and the ones that the
+	// module read, which do not change (see encodedFavicon).
 	favicons []encodedFavicon
 }
 
@@ -70,6 +75,9 @@ func NewScope(upstreams []UpstreamInfo, servers []ServerInfo) *Scope {
 	for _, u := range upstreams {
 		s.upstreams[u.ID] = &scopeUpstream{info: u}
 	}
+	for _, id := range slices.Sorted(maps.Keys(s.upstreams)) {
+		s.upstreamList = append(s.upstreamList, s.upstreams[id])
+	}
 	for _, info := range servers {
 		kick := componentValue(info.Kick)
 		kick.Freeze()
@@ -81,19 +89,22 @@ func NewScope(upstreams []UpstreamInfo, servers []ServerInfo) *Scope {
 			}
 		}
 	}
+	for _, id := range slices.Sorted(maps.Keys(s.servers)) {
+		s.serverList = append(s.serverList, s.servers[id])
+	}
 	return s
 }
 
 // encodedFavicon returns the JSON of favicon if it is one that scripts can read
-// (see encodedFavicon.is): of a static status, or of the last status of an
-// upstream. It returns nil otherwise.
+// (see encodedFavicon.is): of a static status, read by the module, or of the
+// last status of an upstream. It returns nil otherwise.
 func (s *Scope) encodedFavicon(favicon string) json.RawMessage {
 	for _, f := range s.favicons {
 		if f.is(favicon) {
 			return f.json
 		}
 	}
-	for _, u := range s.upstreams {
+	for _, u := range s.upstreamList {
 		if c := u.status.last.Load(); c != nil && c.favicon.is(favicon) {
 			return c.favicon.json
 		}
@@ -101,38 +112,57 @@ func (s *Scope) encodedFavicon(favicon string) json.RawMessage {
 	return nil
 }
 
-// componentValue returns kick, a JSON text component, as a Starlark value, or
-// None if it is missing or invalid.
-func componentValue(kick json.RawMessage) starlark.Value {
-	if kick == nil {
+// componentValue returns component, a JSON text component, as a Starlark
+// value, or None if it is missing or invalid.
+func componentValue(component json.RawMessage) starlark.Value {
+	if component == nil {
 		return starlark.None
 	}
-	v, err := status.ParseValue(kick)
+	v, err := status.ParseValue(component)
 	if err != nil {
 		return starlark.None
 	}
 	return jsonValue(v)
 }
 
-// value returns what ctx.upstream gives of the upstream u during req.
-func (u *scopeUpstream) value(req *Request) starlark.Value {
-	state := req.upstreamState(u.info.ID)
-	latency, age := starlark.Value(starlark.None), starlark.Value(starlark.None)
-	if state.Polled {
-		latency = starlark.Float(state.Latency.Seconds() * 1000)
-		age = starlark.Float(state.Age.Seconds() * 1000)
-	}
-	return starlarkstruct.FromStringDict(starlark.String("upstream"), starlark.StringDict{
-		"id":         starlark.String(u.info.ID),
-		"address":    starlark.String(u.info.Address),
-		"status":     u.status.value(state.Status),
-		"latency_ms": latency,
-		"age_ms":     age,
-	})
+// upstreamView is an upstream during a request: the state of the objects of
+// upstreamKind, which ctx.upstream and ctx.upstreams give.
+type upstreamView struct {
+	u   *scopeUpstream
+	req *Request
 }
 
+// upstreamKind is the kind of the upstreams of scripts. Its fields that depend
+// on the state of the upstream read it only if asked, so that scripts that only
+// list upstreams never depend on them.
+var upstreamKind = newObjectKind("upstream", func(v upstreamView) string {
+	return "upstream(id = " + starlark.String(v.u.info.ID).String() + ")"
+}, []objectAttr[upstreamView]{
+	{name: "address", field: func(v upstreamView) starlark.Value { return starlark.String(v.u.info.Address) }},
+	// Since the last successful poll, and its latency below, None before any.
+	{name: "age_ms", field: func(v upstreamView) starlark.Value {
+		state := v.req.upstreamState(v.u.info.ID)
+		if !state.Polled {
+			return starlark.None
+		}
+		return starlark.Float(state.Age.Seconds() * 1000)
+	}},
+	{name: "id", field: func(v upstreamView) starlark.Value { return starlark.String(v.u.info.ID) }},
+	{name: "latency_ms", field: func(v upstreamView) starlark.Value {
+		state := v.req.upstreamState(v.u.info.ID)
+		if !state.Polled {
+			return starlark.None
+		}
+		return starlark.Float(state.Latency.Seconds() * 1000)
+	}},
+	{name: "status", field: func(v upstreamView) starlark.Value {
+		return v.u.status.value(v.req.upstreamState(v.u.info.ID).Status)
+	}},
+})
+
 // serverView is a server during a request: the state of the objects of
-// serverKind, the server variable of hooks and what ctx.server gives.
+// serverKind, the server variable of hooks and what ctx.server and
+// ctx.servers give.
 type serverView struct {
 	scope *Scope
 	srv   *scopeServer
@@ -140,8 +170,8 @@ type serverView struct {
 }
 
 // serverKind is the kind of the servers of scripts. Its status is the one that
-// it shows without hooks: the one of its upstream while available, read only
-// if asked, so that scripts that do not read it never depend on upstreams.
+// it shows without hooks: the one of its upstream while available, read only if
+// asked, so that scripts that do not read it never depend on upstreams.
 var serverKind = newObjectKind("server", func(v serverView) string {
 	return "server(id = " + starlark.String(v.srv.info.ID).String() + ")"
 }, []objectAttr[serverView]{

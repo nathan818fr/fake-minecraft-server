@@ -1,8 +1,12 @@
 package config
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/png"
 	"log/slog"
 	"maps"
 	"net/netip"
@@ -21,6 +25,18 @@ import (
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/upstream"
 )
 
+// testIcon is a 64×64 PNG image, and testFavicon its favicon.
+var (
+	testIcon    = encodePNG(64, 64)
+	testFavicon = status.FaviconPrefix + base64.StdEncoding.EncodeToString(testIcon)
+)
+
+func encodePNG(width, height int) []byte {
+	var b bytes.Buffer
+	_ = png.Encode(&b, image.NewGray(image.Rect(0, 0, width, height))) // Writes to memory.
+	return b.Bytes()
+}
+
 func loadEnv(vars map[string]string) (Config, error) {
 	var environ []string
 	for name, value := range vars {
@@ -34,7 +50,7 @@ func loadEnv(vars map[string]string) (Config, error) {
 func writeConfigFile(t *testing.T, content string) string {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "icon.png"), pngSignature, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "icon.png"), testIcon, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "config.yaml")
@@ -192,7 +208,7 @@ rules:
 
 	// Every field is kept, and the favicon is read.
 	want := `{"description":{"extra":[{"color":"gold","text":"world"}],"text":"Hello\n"},"enforcesSecureChat":true,` +
-		`"favicon":"data:image/png;base64,iVBORw0KGgo=",` +
+		`"favicon":"` + testFavicon + `",` +
 		`"players":{"max":100,"online":2,"sample":[{"id":"069a79f4-44e9-4726-a5be-fca90e38aaf5","name":"Notch"}]},` +
 		`"version":{"name":"1.21.10","protocol":773}}`
 	if got := statusJSON(t, cfg, "default"); got != want {
@@ -543,9 +559,16 @@ func TestCheckErrors(t *testing.T) {
 		},
 		{"NaN", "servers:\n  default:\n    status: { values: [1, .nan] }\n", "servers.default.status: json: unsupported value: NaN"},
 		{"favicon not a string", "servers:\n  default:\n    status: { favicon: 1 }\n", "servers.default.status.favicon: must be the path of a PNG file or a data URI, got 1"},
+		{"favicon of another format", "servers:\n  default:\n    status: { favicon: \"data:image/jpeg;base64,AAAA\" }\n", `servers.default.status.favicon: must start with "data:image/png;base64,"`},
 		{
-			"oversized status", "servers:\n  default:\n    status: { favicon: \"data:image/png;base64," + strings.Repeat("A", 32767) + "\" }\n",
-			"servers.default.status: too long: 32875 characters, the limit is 32767 (is the favicon too large?)",
+			"favicon of another size", "servers:\n  default:\n    status: { favicon: \"data:image/png;base64," + base64.StdEncoding.EncodeToString(encodePNG(128, 128)) + "\" }\n",
+			"servers.default.status.favicon: is 128×128 pixels, clients only show 64×64 favicons",
+		},
+		{
+			// A valid favicon, made larger with bytes after the image.
+			"oversized status", "servers:\n  default:\n    status: { favicon: \"" + status.FaviconPrefix +
+				base64.StdEncoding.EncodeToString(append(slices.Clip(testIcon), make([]byte, 24576-len(testIcon))...)) + "\" }\n",
+			"servers.default.status: too long: 32876 characters, the limit is 32767 (is the favicon too large?)",
 		},
 		{
 			"oversized kick message", "servers:\n  lobby: { kick: " + strings.Repeat("a", 262144) + " }\n",
@@ -631,7 +654,7 @@ func TestFaviconErrors(t *testing.T) {
 	path := writeConfigFile(t, "servers:\n  missing: { status: { favicon: missing.png } }\n  config: { status: { favicon: config.yaml } }\n")
 	dir := filepath.Dir(path)
 	_, err := loadEnv(map[string]string{"FMS_CONFIG_FILE": path})
-	want := "servers.config.status.favicon: " + filepath.Join(dir, "config.yaml") + " is not a PNG file\n" +
+	want := "servers.config.status.favicon: " + filepath.Join(dir, "config.yaml") + " is not a PNG image\n" +
 		"servers.missing.status.favicon: open " + filepath.Join(dir, "missing.png") + ": no such file or directory"
 	if err == nil || err.Error() != want {
 		t.Errorf("Load() error = %v, want %s", err, want)

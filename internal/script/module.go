@@ -4,10 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
+
+	"github.com/nathan818fr/fake-minecraft-server/v2/internal/status"
 )
 
 // maxLoadSteps bounds the work of the top level of a module, which runs once,
@@ -31,11 +34,22 @@ type module struct {
 	globals starlark.StringDict
 }
 
+// moduleLoading is what fms.read_favicon needs while a module loads, held by
+// its thread under moduleLoadingKey: the directory that the paths are relative
+// to, and the favicons read (see encodedFavicon).
+type moduleLoading struct {
+	dir      string
+	favicons []encodedFavicon
+}
+
+const moduleLoadingKey = "fms.module_loading"
+
 // LoadModule runs src, a Starlark file, once, and gives its globals to the
-// scripts compiled with s from then on. It checks, like CompileCondition,
-// the fields of client and the literal arguments of the functions, and
-// reports the mistakes of src with their positions in it.
-func (s *Scope) LoadModule(src string) (err error) {
+// scripts compiled with s from then on. The paths that it reads are relative
+// to dir. It checks, like CompileCondition, the fields of client and the
+// literal arguments of the functions, and reports the mistakes of src with
+// their positions in it.
+func (s *Scope) LoadModule(src, dir string) (err error) {
 	defer func() { s.moduleFailed = err != nil }()
 	file, err := dialect.Parse("", src, 0)
 	if err != nil {
@@ -47,7 +61,7 @@ func (s *Scope) LoadModule(src string) (err error) {
 	if err := checkFields(file, 0, scriptVariables); err != nil {
 		return err
 	}
-	if err := s.checkLiterals(file, 0); err != nil {
+	if err := s.checkLiterals(file, 0, true); err != nil {
 		return err
 	}
 
@@ -59,6 +73,8 @@ func (s *Scope) LoadModule(src string) (err error) {
 	m := &module{}
 	thread := &starlark.Thread{Print: func(_ *starlark.Thread, msg string) { s.prints = append(s.prints, msg) }}
 	thread.SetMaxExecutionSteps(maxLoadSteps)
+	loading := &moduleLoading{dir: dir}
+	thread.SetLocal(moduleLoadingKey, loading)
 	globals, err := program.Init(thread, predeclared)
 	if err != nil {
 		return loadError(err)
@@ -66,18 +82,20 @@ func (s *Scope) LoadModule(src string) (err error) {
 	globals.Freeze()
 	m.globals = globals
 	s.module = m
+	s.favicons = append(s.favicons, loading.favicons...)
 	return nil
 }
 
-// LoadModuleFile is LoadModule for the source in the file at path. A file
-// that cannot be read fails the module too (see Scope.moduleFailed).
+// LoadModuleFile is LoadModule for the source in the file at path, whose
+// paths are relative to the directory of the file. A file that cannot be read
+// fails the module too (see Scope.moduleFailed).
 func (s *Scope) LoadModuleFile(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		s.moduleFailed = true
 		return err
 	}
-	return s.LoadModule(string(data))
+	return s.LoadModule(string(data), filepath.Dir(path))
 }
 
 // Prints returns what the top level of the module of s printed when loaded,
@@ -161,3 +179,28 @@ func loadError(err error) error {
 	}
 	return errors.New(evalErr.Msg)
 }
+
+// readFaviconBuiltin implements fms.read_favicon(path), the PNG file at path as
+// a favicon (see status.ReadFavicon). It only works while the module loads, so
+// that requests never read files: modules keep favicons in globals.
+func readFaviconBuiltin(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var path string
+	if err := starlark.UnpackPositionalArgs(b.Name(), args, kwargs, 1, &path); err != nil {
+		return nil, err
+	}
+	loading, ok := thread.Local(moduleLoadingKey).(*moduleLoading)
+	if !ok {
+		return nil, errReadFaviconAfterLoad
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(loading.dir, path)
+	}
+	uri, err := status.ReadFavicon(path)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", b.Name(), err)
+	}
+	loading.favicons = append(loading.favicons, encodedFavicon{text: uri, json: status.AppendValue(nil, uri)})
+	return starlark.String(uri), nil
+}
+
+var errReadFaviconAfterLoad = errors.New("fms.read_favicon: only works while the script loads: keep favicons in globals")
