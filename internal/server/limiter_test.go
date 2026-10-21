@@ -7,7 +7,8 @@ import (
 )
 
 func TestClientLimiter(t *testing.T) {
-	l := newClientLimiter(2)
+	var l clientLimiter
+	l.setLimit(2)
 	a := netip.MustParseAddr("192.0.2.1")
 	b := netip.MustParseAddr("192.0.2.2")
 
@@ -37,7 +38,8 @@ func TestClientLimiter(t *testing.T) {
 }
 
 func TestClientLimiterGroupsClients(t *testing.T) {
-	l := newClientLimiter(1)
+	var l clientLimiter
+	l.setLimit(1)
 	if !l.acquire(netip.MustParseAddr("2001:db8:1:2::1")) {
 		t.Fatal("acquire() refused the first connection")
 	}
@@ -57,7 +59,8 @@ func TestClientLimiterGroupsClients(t *testing.T) {
 }
 
 func TestRateLimiter(t *testing.T) {
-	l := rateLimiter{rate: 10}
+	var l rateLimiter
+	l.setRate(10)
 	a := netip.MustParseAddr("192.0.2.1")
 	now := time.Now()
 
@@ -84,17 +87,19 @@ func TestRateLimiter(t *testing.T) {
 		t.Error("allow() accepted a second connection within 1/rate seconds")
 	}
 
-	unlimited := rateLimiter{}
-	if !unlimited.allow(a, now) {
+	l.setRate(0)
+	if !l.allow(a, now.Add(150*time.Millisecond)) {
 		t.Error("allow() refused a connection without a rate")
 	}
+	l.setRate(10)
 	if !l.allow(netip.Addr{}, now) {
 		t.Error("allow() limited a client without an address")
 	}
 }
 
 func TestRateLimiterGroupsClients(t *testing.T) {
-	l := rateLimiter{rate: 1}
+	var l rateLimiter
+	l.setRate(1)
 	now := time.Now()
 	for _, s := range []string{"2001:db8:1:2::1", "2001:db8:1:2:ffff::1"} {
 		l.allow(netip.MustParseAddr(s), now)
@@ -110,7 +115,8 @@ func TestRateLimiterGroupsClients(t *testing.T) {
 // The clients tracked are bounded: expired ones are removed, and past the
 // bound, new clients are not limited.
 func TestRateLimiterBoundsClients(t *testing.T) {
-	l := rateLimiter{rate: 1}
+	var l rateLimiter
+	l.setRate(1)
 	now := time.Now()
 	client := func(i int) netip.Addr {
 		return netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})

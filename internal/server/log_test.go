@@ -242,7 +242,8 @@ func TestLoggingRejectedConnections(t *testing.T) {
 
 // Lines that the log level hides take no room in the rate limit.
 func TestLogLimiterSkipsHiddenLines(t *testing.T) {
-	s := &Server{logger: slog.New(logging.NewTextHandler(io.Discard, slog.LevelWarn)), logLimiter: logLimiter{perSecond: 1}}
+	s := &Server{logger: slog.New(logging.NewTextHandler(io.Discard, slog.LevelWarn))}
+	s.logLimiter.setLimit(1)
 	for range 3 {
 		s.logInvalid(&connInfo{start: time.Now()}, headRecorder{}, io.EOF)
 	}
@@ -252,7 +253,8 @@ func TestLogLimiterSkipsHiddenLines(t *testing.T) {
 }
 
 func TestLogLimiter(t *testing.T) {
-	l := logLimiter{perSecond: 2}
+	var l logLimiter
+	l.setLimit(2)
 	second := time.Unix(1000, 0)
 
 	for i := range 2 {

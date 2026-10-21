@@ -365,3 +365,26 @@ func TestPollerResolve(t *testing.T) {
 		})
 	}
 }
+
+// A poller that replaces another, for another address, keeps its status until
+// the status expires, as old as it was.
+func TestPollerInherit(t *testing.T) {
+	ln := listen(t, "127.0.0.1:0")
+	startUpstream(t, ln, upstreamStatus, io.Discard)
+	cfg := testConfig(ln.Addr().String())
+	previous, _, stop := startPoller(t, cfg)
+	waitFor(t, "a status", func() bool { return previous.State().Status != nil })
+	stop()
+	time.Sleep(cfg.MaxAge / 2)
+
+	p := upstream.NewPoller("lobby", testConfig("192.0.2.1:25565"), slog.New(slog.DiscardHandler))
+	p.Inherit(previous)
+	if st := p.State(); st.Status == nil || st.Age < cfg.MaxAge/2 {
+		t.Fatalf("State() = %+v, want the status of the previous poller, as old", st)
+	}
+	inherited := time.Now()
+	waitFor(t, "the status to expire", func() bool { return p.State().Status == nil })
+	if elapsed := time.Since(inherited); elapsed >= cfg.MaxAge {
+		t.Errorf("status expired %v after it was inherited, want before its max age (%v)", elapsed, cfg.MaxAge)
+	}
+}

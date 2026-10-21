@@ -68,6 +68,14 @@ func newPoller(id string, cfg Config, logger *slog.Logger, r resolver) *Poller {
 	return &Poller{cfg: cfg, logger: logger.With("upstream", id, "address", cfg.Address()), resolver: r}
 }
 
+// Inherit makes p, which replaces previous, stopped, with another
+// configuration, start from the last status that previous received. The status
+// keeps its age, so that it stays in use until p receives one, or until the
+// max age of p after it was received.
+func (p *Poller) Inherit(previous *Poller) {
+	p.latest.Store(previous.latest.Load())
+}
+
 // Address returns the address of the server as configured: host, or
 // host:port.
 func (cfg Config) Address() string {

@@ -23,14 +23,10 @@ func TestHealthcheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	listeners, err := listen(context.Background(), cfg.Listeners)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { closeAll(listeners) })
+	listeners := openListeners(t, cfg.Listeners...)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- srv.Serve(ctx, listeners...) }()
+	go func() { done <- srv.Serve(ctx, listeners[0].Listener) }()
 	t.Cleanup(func() {
 		cancel()
 		if err := <-done; err != nil {

@@ -88,10 +88,11 @@ func (s *Server) status(sess *session, server VirtualServer) (*status.Status, an
 // one of the first rule that applies, whatever the request. It records the
 // rule and the server in sess.
 func (s *Server) serverFor(sess *session) VirtualServer {
-	for _, rule := range s.cfg.Rules {
+	cfg := &sess.state.cfg
+	for _, rule := range cfg.Rules {
 		if s.matches(rule, sess) {
 			sess.rule, sess.server = rule.Name, rule.Server
-			return s.cfg.Servers[rule.Server]
+			return cfg.Servers[rule.Server]
 		}
 	}
 	panic("no rule applies") // The last rule always applies (see checkServers).
@@ -154,10 +155,10 @@ type hookError struct {
 }
 
 // checkServers checks the virtual servers, which must all have a static status
-// and a kick message, and whose upstreams must be in upstreams, and the rules,
-// which must all target one. The last rule must have no conditions, so that
-// every client gets an answer.
-func checkServers(cfg *Config, upstreams map[string]Upstream) error {
+// and a kick message, and whose upstreams must be in cfg, and the rules, which
+// must all target one. The last rule must have no conditions, so that every
+// client gets an answer.
+func checkServers(cfg *Config) error {
 	if len(cfg.Rules) == 0 {
 		return errors.New("no rules")
 	}
@@ -171,7 +172,7 @@ func checkServers(cfg *Config, upstreams map[string]Upstream) error {
 	}
 	for _, id := range slices.Sorted(maps.Keys(cfg.Servers)) {
 		server := cfg.Servers[id]
-		if _, ok := upstreams[server.Upstream]; !ok && server.Upstream != "" {
+		if _, ok := cfg.Upstreams[server.Upstream]; !ok && server.Upstream != "" {
 			return fmt.Errorf("server %s: no upstream %q", id, server.Upstream)
 		}
 		if server.Status == nil {
