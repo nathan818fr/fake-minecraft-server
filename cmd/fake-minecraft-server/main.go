@@ -71,7 +71,12 @@ func main() {
 }
 
 func run() error {
-	cfg, err := load()
+	// First, as SIGHUP stops the process by default: until the server serves,
+	// reload signals wait.
+	reloads := make(chan os.Signal, 1)
+	signal.Notify(reloads, syscall.SIGHUP)
+
+	cfg, level, err := load()
 	if err != nil {
 		return err
 	}
@@ -94,13 +99,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	r := reloader{srv: srv, logger: logger, level: level, format: cfg.LogFormat}
+	for i, ln := range listeners {
+		r.listeners = append(r.listeners, openListener{settings: cfg.Listeners[i], Listener: ln})
+	}
+	go r.run(ctx, reloads)
 	return srv.Serve(ctx, listeners...)
 }
 
 // check loads the configuration and makes the server as run does, without
 // listening.
 func check() error {
-	cfg, err := load()
+	cfg, _, err := load()
 	if err != nil {
 		return err
 	}
@@ -113,19 +123,21 @@ func check() error {
 }
 
 // load reads the configuration, and sets up the logger that it configures.
-func load() (config.Config, error) {
+func load() (config.Config, *slog.LevelVar, error) {
 	cfg, err := config.Load(os.Environ())
+	level := new(slog.LevelVar)
 	if cfg.LogFormat != "" {
 		// Errors returned from now on, including the ones of the other
 		// settings, are logged in the configured format too.
-		slog.SetDefault(slog.New(logging.NewHandler(os.Stdout, cfg.LogFormat, cfg.LogLevel)))
+		level.Set(cfg.LogLevel)
+		slog.SetDefault(slog.New(logging.NewHandler(os.Stdout, cfg.LogFormat, level)))
 	}
 	if err != nil {
 		// At the level of the errors, which they may explain, so that they
 		// are shown whatever the log level.
 		logScriptPrints(slog.Default(), slog.LevelError, cfg.ScriptPrints)
 	}
-	return cfg, err
+	return cfg, level, err
 }
 
 // logScriptPrints logs prints, what the top level of the script printed when

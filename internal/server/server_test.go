@@ -128,14 +128,38 @@ func listenTCP(t testing.TB) net.Listener {
 }
 
 // serve serves the listeners with the server made of cfg and upstreams (see
-// newServer), and returns a function that stops it and waits for its
-// connections to finish.
+// newServerWithUpstreams), and returns a function that stops it and waits for
+// its connections to finish.
 func serve(t testing.TB, cfg Config, upstreams map[string]Upstream, logger *slog.Logger, listeners ...Listener) func() {
 	t.Helper()
-	srv, err := newServer(cfg, upstreams, logger)
+	srv := newServerWithUpstreams(t, cfg, upstreams, logger)
+	return serveServer(t, srv, listeners...)
+}
+
+// newServerWithUpstreams returns the server of cfg with upstreams, such as
+// fakes, in place of the upstreams of cfg.
+func newServerWithUpstreams(t testing.TB, cfg Config, upstreams map[string]Upstream, logger *slog.Logger) *Server {
+	t.Helper()
+	srv, err := newServer(withUpstreams(cfg, upstreams), func(id string, _ upstream.Config, _ Upstream) Upstream { return upstreams[id] }, logger)
 	if err != nil {
 		t.Fatalf("newServer() error: %v", err)
 	}
+	return srv
+}
+
+// withUpstreams returns cfg with an upstream for each ID of upstreams.
+func withUpstreams(cfg Config, upstreams map[string]Upstream) Config {
+	cfg.Upstreams = make(map[string]upstream.Config, len(upstreams))
+	for id := range upstreams {
+		cfg.Upstreams[id] = upstream.Config{Host: id}
+	}
+	return cfg
+}
+
+// serveServer serves the listeners with srv, and returns a function that stops
+// it and waits for its connections to finish.
+func serveServer(t testing.TB, srv *Server, listeners ...Listener) func() {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(ctx, listeners...) }()

@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -106,58 +107,165 @@ type Upstream interface {
 }
 
 type Server struct {
+	logger       *slog.Logger
+	makeUpstream upstreamMaker
+	// state is the configuration that new connections take (see state).
+	state atomic.Pointer[state]
+
+	connLimiter        connLimiter
+	clientLimiter      clientLimiter
+	rateLimiter        rateLimiter
+	logLimiter         logLimiter
+	scriptErrorLimiter scriptErrorLimiter
+
+	// reloads takes the reloads to Serve, which applies them, and stopped is
+	// closed once it no longer does.
+	reloads chan reload
+	stopped chan struct{}
+}
+
+// upstreamMaker makes the upstream with the ID id, polled with cfg. previous
+// is the upstream that had this ID until a reload changed its configuration,
+// if any, stopped: the new one starts from what it knew, so that changing the
+// address of an upstream does not make it unavailable.
+type upstreamMaker func(id string, cfg upstream.Config, previous Upstream) Upstream
+
+// state is a configuration with its upstreams. Each connection takes the
+// current one when it starts, and keeps it until it ends, so that a reload
+// never answers it with parts of two configurations.
+type state struct {
 	cfg       Config
-	logger    *slog.Logger
 	upstreams map[string]Upstream
 	// upstreamIndexes number the upstreams, for the states that requests read
 	// (see upstreamState).
 	upstreamIndexes map[string]int
-
-	connLimiter        semaphore
-	clientLimiter      *clientLimiter
-	rateLimiter        rateLimiter
-	logLimiter         logLimiter
-	scriptErrorLimiter scriptErrorLimiter
 }
 
 func New(cfg Config, logger *slog.Logger) (*Server, error) {
-	upstreams := make(map[string]Upstream, len(cfg.Upstreams))
-	for id, upstreamCfg := range cfg.Upstreams {
-		upstreams[id] = upstream.NewPoller(id, upstreamCfg, logger)
-	}
-	return newServer(cfg, upstreams, logger)
+	return newServer(cfg, func(id string, cfg upstream.Config, previous Upstream) Upstream {
+		p := upstream.NewPoller(id, cfg, logger)
+		if previous, ok := previous.(*upstream.Poller); ok {
+			p.Inherit(previous)
+		}
+		return p
+	}, logger)
 }
 
-// newServer is New with the upstreams already made, such as fakes in tests.
-func newServer(cfg Config, upstreams map[string]Upstream, logger *slog.Logger) (*Server, error) {
-	if cfg.ConnectionTimeout <= 0 || cfg.HandshakeTimeout <= 0 {
-		return nil, errors.New("connection and handshake timeouts must be positive")
-	}
-	if err := checkServers(&cfg, upstreams); err != nil {
+// newServer is New with makeUpstream making the upstreams, such as fakes in
+// tests.
+func newServer(cfg Config, makeUpstream upstreamMaker, logger *slog.Logger) (*Server, error) {
+	if err := checkConfig(&cfg); err != nil {
 		return nil, err
 	}
-
-	upstreamIndexes := make(map[string]int, len(upstreams))
-	for i, id := range slices.Sorted(maps.Keys(upstreams)) {
-		upstreamIndexes[id] = i
+	s := &Server{
+		logger:       logger,
+		makeUpstream: makeUpstream,
+		reloads:      make(chan reload),
+		stopped:      make(chan struct{}),
 	}
-	return &Server{
-		cfg:             cfg,
-		logger:          logger,
-		upstreams:       upstreams,
-		upstreamIndexes: upstreamIndexes,
+	s.state.Store(s.newState(cfg, nil))
+	s.setLimits(cfg)
+	return s, nil
+}
 
-		connLimiter:   newSemaphore(cfg.MaxConnections),
-		clientLimiter: newClientLimiter(cfg.MaxConnectionsPerIP),
-		rateLimiter:   rateLimiter{rate: cfg.ConnectionRateLimitPerIP},
-		logLimiter:    logLimiter{perSecond: cfg.LogRateLimit},
-	}, nil
+func checkConfig(cfg *Config) error {
+	if cfg.ConnectionTimeout <= 0 || cfg.HandshakeTimeout <= 0 {
+		return errors.New("connection and handshake timeouts must be positive")
+	}
+	return checkServers(cfg)
+}
+
+// newState returns the state of cfg, with the upstreams of previous that it
+// keeps (see state.keeps), and new ones for the others.
+func (s *Server) newState(cfg Config, previous *state) *state {
+	st := &state{
+		cfg:             cfg,
+		upstreams:       make(map[string]Upstream, len(cfg.Upstreams)),
+		upstreamIndexes: make(map[string]int, len(cfg.Upstreams)),
+	}
+	for i, id := range slices.Sorted(maps.Keys(cfg.Upstreams)) {
+		st.upstreamIndexes[id] = i
+		var old Upstream
+		if previous != nil {
+			old = previous.upstreams[id]
+			if previous.keeps(cfg, id) {
+				st.upstreams[id] = old
+				continue
+			}
+		}
+		st.upstreams[id] = s.makeUpstream(id, cfg.Upstreams[id], old)
+	}
+	return st
+}
+
+// keeps reports whether the state of cfg keeps the upstream id of st, which
+// it does if its configuration is unchanged.
+func (st *state) keeps(cfg Config, id string) bool {
+	upstreamCfg, ok := cfg.Upstreams[id]
+	return ok && upstreamCfg == st.cfg.Upstreams[id]
+}
+
+// setLimits sets the limits of cfg, which apply to the connections already
+// open too.
+func (s *Server) setLimits(cfg Config) {
+	s.connLimiter.setLimit(cfg.MaxConnections)
+	s.clientLimiter.setLimit(cfg.MaxConnectionsPerIP)
+	s.rateLimiter.setRate(cfg.ConnectionRateLimitPerIP)
+	s.logLimiter.setLimit(cfg.LogRateLimit)
+}
+
+// serving is what Serve runs, which reloads change: the accept loops of the
+// listeners, and the polling of the upstreams, by ID.
+type serving struct {
+	ctx context.Context
+	// failed receives the error of the first listener that fails.
+	failed chan error
+	conns  sync.WaitGroup
+	loops  map[net.Listener]*acceptLoop
+	polls  map[string]task
+}
+
+// task is a goroutine of Serve, which can be stopped alone.
+type task struct {
+	stop context.CancelFunc
+	done chan struct{}
+}
+
+func (r *serving) start(run func(ctx context.Context)) task {
+	ctx, stop := context.WithCancel(r.ctx)
+	t := task{stop: stop, done: make(chan struct{})}
+	go func() {
+		defer close(t.done)
+		run(ctx)
+	}()
+	return t
+}
+
+// end stops t and waits for it to return.
+func (t task) end() {
+	t.stop()
+	<-t.done
+}
+
+// acceptLoop accepts the connections of a listener (see Server.accept).
+type acceptLoop struct {
+	task
+	// info is what its connections know of the listener, which reloads change.
+	info atomic.Pointer[listenerInfo]
+}
+
+// reload is a call to Reload, which Serve applies, then closes done.
+type reload struct {
+	cfg       Config
+	listeners []Listener
+	done      chan struct{}
 }
 
 // Serve accepts connections on the listeners until ctx is canceled or one of
 // them fails, then closes them all and waits for the remaining connections to
 // finish. The limits apply to all the listeners together. The upstreams are
-// polled meanwhile.
+// polled meanwhile. Reload changes the configuration and the listeners while
+// it serves. A server serves once.
 func (s *Server) Serve(ctx context.Context, listeners ...Listener) error {
 	if len(listeners) == 0 {
 		return errors.New("no listener to serve")
@@ -165,47 +273,142 @@ func (s *Server) Serve(ctx context.Context, listeners ...Listener) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var polling sync.WaitGroup
-	for _, u := range s.upstreams {
-		polling.Go(func() { u.Run(ctx) })
+	r := &serving{
+		ctx:    ctx,
+		failed: make(chan error, 1),
+		loops:  make(map[net.Listener]*acceptLoop, len(listeners)),
+		polls:  make(map[string]task),
 	}
-
-	var conns sync.WaitGroup
-
-	errs := make(chan error, len(listeners))
-	for _, ln := range listeners {
-		var proxyProtocol slog.Attr
-		if ln.Options.ProxyProtocol {
-			proxyProtocol = slog.Bool("proxy_protocol", true)
-		}
-		s.logger.LogAttrs(ctx, slog.LevelInfo, "listening", slog.String("listener", listenerAddr(ln)), proxyProtocol)
-		go func() { errs <- s.accept(ctx, ln, len(listeners) > 1, &conns) }()
-	}
+	s.poll(r)
+	s.setListeners(r, listeners)
 
 	var err error
-	for range listeners {
-		if lnErr := <-errs; lnErr != nil && err == nil {
-			err = lnErr
-			cancel() // Stop the other listeners.
+serve:
+	for {
+		select {
+		case <-ctx.Done():
+			break serve
+		case err = <-r.failed:
+			break serve
+		case req := <-s.reloads:
+			s.apply(r, req.cfg, req.listeners)
+			close(req.done)
 		}
+	}
+	close(s.stopped)
+
+	cancel() // Stops the accept loops and the upstreams.
+	for _, loop := range r.loops {
+		<-loop.done
 	}
 	if err == nil {
 		s.logger.Info("stopping")
 	}
-	conns.Wait()
-	cancel() // Stops polling the upstreams.
-	polling.Wait()
+	r.conns.Wait()
+	for _, t := range r.polls {
+		<-t.done
+	}
 	if err == nil {
 		s.logger.Info("stopped")
 	}
 	return err
 }
 
+// Reload makes Serve use cfg and listeners from now on, or returns an error,
+// and leaves both as they were, if cfg is invalid. Connections that already
+// started end with their configuration, but count against the new limits.
+// The upstreams whose configuration is unchanged keep polling, and the others
+// start over, from what the upstream they replace knew. Serve starts
+// accepting on the new listeners, keeps the others open with their new
+// options, and closes the ones not in listeners, once their accept loop
+// ends. Reload waits for Serve to start.
+func (s *Server) Reload(cfg Config, listeners ...Listener) error {
+	if len(listeners) == 0 {
+		return errors.New("no listener to serve")
+	}
+	if err := checkConfig(&cfg); err != nil {
+		return err
+	}
+	req := reload{cfg: cfg, listeners: listeners, done: make(chan struct{})}
+	select {
+	case s.reloads <- req:
+		<-req.done
+		return nil
+	case <-s.stopped:
+		return errors.New("server stopped")
+	}
+}
+
+// apply applies a reload to what Serve runs: the upstreams that the new state
+// does not keep stop before it replaces them, so that their replacements start
+// from all they knew.
+func (s *Server) apply(r *serving, cfg Config, listeners []Listener) {
+	previous := s.state.Load()
+	for id, t := range r.polls {
+		if !previous.keeps(cfg, id) {
+			t.end()
+			delete(r.polls, id)
+		}
+	}
+	s.state.Store(s.newState(cfg, previous))
+	s.setLimits(cfg)
+	s.poll(r)
+	s.setListeners(r, listeners)
+}
+
+// poll starts polling the upstreams of the current state that are not polled
+// yet.
+func (s *Server) poll(r *serving) {
+	for id, u := range s.state.Load().upstreams {
+		if _, ok := r.polls[id]; !ok {
+			r.polls[id] = r.start(u.Run)
+		}
+	}
+}
+
+// setListeners makes Serve accept connections on listeners: it starts on the
+// new ones, gives the others their options, and closes the ones not in
+// listeners.
+func (s *Server) setListeners(r *serving, listeners []Listener) {
+	listed := make(map[net.Listener]bool, len(listeners))
+	for _, ln := range listeners {
+		listed[ln.Listener] = true
+		info := &listenerInfo{addr: listenerAddr(ln), logged: len(listeners) > 1, ListenerOptions: ln.Options}
+		if loop, ok := r.loops[ln.Listener]; ok {
+			loop.info.Store(info)
+			continue
+		}
+
+		var proxyProtocol slog.Attr
+		if ln.Options.ProxyProtocol {
+			proxyProtocol = slog.Bool("proxy_protocol", true)
+		}
+		s.logger.LogAttrs(r.ctx, slog.LevelInfo, "listening", slog.String("listener", info.addr), proxyProtocol)
+		loop := &acceptLoop{}
+		loop.info.Store(info)
+		loop.task = r.start(func(ctx context.Context) {
+			if err := s.accept(ctx, ln, loop, &r.conns); err != nil {
+				select {
+				case r.failed <- err:
+				default: // Another listener failed first.
+				}
+			}
+		})
+		r.loops[ln.Listener] = loop
+	}
+
+	for ln, loop := range r.loops {
+		if !listed[ln] {
+			loop.end()
+			delete(r.loops, ln)
+			s.logger.Info("stopped listening", "listener", loop.info.Load().addr)
+		}
+	}
+}
+
 // accept accepts connections on ln until ctx is canceled, then closes ln. It
-// returns the error of ln if it fails before. Logs show the address of ln if
-// logListener.
-func (s *Server) accept(ctx context.Context, ln Listener, logListener bool, conns *sync.WaitGroup) error {
-	listener := listenerInfo{addr: listenerAddr(ln), logged: logListener, ListenerOptions: ln.Options}
+// returns the error of ln if it fails before.
+func (s *Server) accept(ctx context.Context, ln Listener, loop *acceptLoop, conns *sync.WaitGroup) error {
 	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
 	defer stop()
 
@@ -218,11 +421,12 @@ func (s *Server) accept(ctx context.Context, ln Listener, logListener bool, conn
 			if errors.Is(err, net.ErrClosed) {
 				return err
 			}
-			s.logger.Error("accept failed", "listener", listener.addr, logging.Error(err))
+			s.logger.Error("accept failed", "listener", loop.info.Load().addr, logging.Error(err))
 			time.Sleep(acceptRetryDelay)
 			continue
 		}
 
+		listener := *loop.info.Load()
 		if !s.connLimiter.tryAcquire() {
 			abort(conn)
 			c := newConnInfo(conn, listener)
@@ -258,7 +462,8 @@ func listenerAddr(ln net.Listener) string {
 // session is a connection, and what the client sent on it, recorded by
 // exchange and logged once it ends.
 type session struct {
-	conn connInfo
+	conn  connInfo
+	state *state
 
 	handshake modernproto.Handshake
 	// rule is the name of the rule that answered, if any, server the ID of its
@@ -296,16 +501,16 @@ type upstreamRead struct {
 // upstreamState returns the state of the upstream with the ID id, read once
 // per request, or an unavailable state if there is no such upstream.
 func (s *Server) upstreamState(sess *session, id string) upstream.State {
-	i, ok := s.upstreamIndexes[id]
+	i, ok := sess.state.upstreamIndexes[id]
 	if !ok {
 		return upstream.State{}
 	}
 	if sess.upstreamStates == nil {
-		sess.upstreamStates = make([]upstreamRead, len(s.upstreamIndexes))
+		sess.upstreamStates = make([]upstreamRead, len(sess.state.upstreamIndexes))
 	}
 	r := &sess.upstreamStates[i]
 	if !r.read {
-		r.state, r.read = s.upstreams[id].State(), true
+		r.state, r.read = sess.state.upstreams[id].State(), true
 	}
 	return r.state
 }
@@ -391,7 +596,7 @@ func (s *Server) handle(conn net.Conn, listener listenerInfo) {
 	buffers.reader.Reset(&buffers.head)
 	// Set in place, as a session literal would be made on the stack first.
 	sess := &buffers.session
-	sess.conn = newConnInfo(conn, listener)
+	sess.conn, sess.state = newConnInfo(conn, listener), s.state.Load()
 	defer func() {
 		// The pool must not keep the connection, nor what the client sent,
 		// alive.
@@ -400,9 +605,9 @@ func (s *Server) handle(conn net.Conn, listener listenerInfo) {
 		connBuffersPool.Put(buffers)
 	}()
 
-	c := &sess.conn
-	connDeadline := c.start.Add(s.cfg.ConnectionTimeout)
-	handshakeDeadline := earliest(c.start.Add(s.cfg.HandshakeTimeout), connDeadline)
+	c, cfg := &sess.conn, &sess.state.cfg
+	connDeadline := c.start.Add(cfg.ConnectionTimeout)
+	handshakeDeadline := earliest(c.start.Add(cfg.HandshakeTimeout), connDeadline)
 	_ = conn.SetDeadline(connDeadline)
 	_ = conn.SetReadDeadline(handshakeDeadline)
 
@@ -561,7 +766,7 @@ func (s *Server) answerStatus(conn net.Conn, buffers *connBuffers, sess *session
 	if err := modernproto.ReadPacketExact(buffers.reader, modernproto.StatusRequestID, nil); err != nil {
 		return fmt.Errorf("reading status request: %w", err)
 	}
-	if err := writeStatus(conn, s.statusFor(sess), s.cfg.SoftwareSignature); err != nil {
+	if err := writeStatus(conn, s.statusFor(sess), sess.state.cfg.SoftwareSignature); err != nil {
 		return err
 	}
 

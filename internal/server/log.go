@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nathan818fr/fake-minecraft-server/v2/internal/logging"
@@ -364,7 +365,7 @@ const scriptErrorInterval = time.Minute
 // the same script. Its zero value is ready to use.
 type scriptErrorLimiter struct {
 	mu      sync.Mutex
-	scripts map[scriptKey]*scriptErrors // As many as the rules and hooks.
+	scripts map[scriptKey]*scriptErrors // As many as the rules and hooks ever configured.
 }
 
 // scriptKey identifies a script for scriptErrorLimiter: the conditions of the
@@ -410,9 +411,9 @@ func (l *scriptErrorLimiter) allow(key scriptKey, now time.Time) (slog.Attr, boo
 // logLimiter bounds how many lines are logged per second, so that floods
 // cannot overwhelm the logs. Dropped lines are counted and reported by the
 // next line logged. A limit of 0 disables it. Callers check the level first,
-// so that the lines it hides take no room.
+// so that the lines it hides take no room. Its zero value is ready to use.
 type logLimiter struct {
-	perSecond int
+	perSecond atomic.Int64
 
 	mu      sync.Mutex
 	second  int64
@@ -420,10 +421,15 @@ type logLimiter struct {
 	dropped int
 }
 
+func (l *logLimiter) setLimit(perSecond int) {
+	l.perSecond.Store(int64(perSecond))
+}
+
 // allow reports whether a line can be logged now and, if so, an attribute
 // counting the lines dropped before it (empty if none, so not logged).
 func (l *logLimiter) allow(now time.Time) (slog.Attr, bool) {
-	if l.perSecond <= 0 {
+	perSecond := int(l.perSecond.Load())
+	if perSecond <= 0 {
 		return slog.Attr{}, true
 	}
 	l.mu.Lock()
@@ -433,7 +439,7 @@ func (l *logLimiter) allow(now time.Time) (slog.Attr, bool) {
 		l.second = second
 		l.count = 0
 	}
-	if l.count >= l.perSecond {
+	if l.count >= perSecond {
 		l.dropped++
 		return slog.Attr{}, false
 	}
