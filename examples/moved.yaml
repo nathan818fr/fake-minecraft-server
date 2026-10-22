@@ -1,0 +1,26 @@
+# The address that players know, after the server moved: the live status of
+# the new server, so that players see it is up, with a message of the day that
+# says it moved, and a kick message that tells them its new address.
+
+upstreams:
+  # The new server, polled like a client pings it. Without a port, its SRV
+  # record is followed, as clients do.
+  default:
+    address: play.example.net
+
+servers:
+  default:
+    # Shown while the new server does not answer.
+    status:
+      description: "§6Example Network §7moved to §bplay.example.net"
+      version: { name: "§bplay.example.net", protocol: -1 }
+    # The status of the new server while it answers, with this message of the
+    # day.
+    ping_script: '{"status": fms.merge(server.status, {"description": server.static_status["description"]})}'
+    kick:
+      text: "Example Network moved!\n\n"
+      color: gold
+      extra:
+        - { text: "Add ", color: gray }
+        - { text: "play.example.net", color: aqua }
+        - { text: " to your server list.", color: gray }

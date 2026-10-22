@@ -1,0 +1,25 @@
+# A server under maintenance: "Maintenance" in red in place of the player
+# counts, news in the lines shown when hovering over it, and a kick message
+# that tells players where to follow the news.
+
+servers:
+  default:
+    status:
+      description: "§6§lExample Network\n§cUnder maintenance, back soon"
+      favicon: example-network.png
+      # A protocol version that no client has: clients show the version name
+      # in red, in place of the player counts.
+      version: { name: "§cMaintenance", protocol: -1 }
+      players:
+        max: 0
+        online: 0
+        sample:
+          - { name: "§6§lExample Network", id: 00000000-0000-0000-0000-000000000000 }
+          - { name: "§7Upgrading to the latest version", id: 00000000-0000-0000-0000-000000000000 }
+          - { name: "§7News: §bstatus.example.com", id: 00000000-0000-0000-0000-000000000000 }
+    kick:
+      text: "Example Network is under maintenance.\n\n"
+      color: gold
+      extra:
+        - { text: "Follow the news on ", color: gray }
+        - { text: "status.example.com", color: aqua }

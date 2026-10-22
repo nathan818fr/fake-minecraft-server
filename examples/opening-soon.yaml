@@ -1,0 +1,40 @@
+# A network that opens soon: its server list entry says so, with links in the
+# lines shown when hovering over the player counts, and players who try to
+# join get a countdown to the opening, next Saturday at 18:00 UTC.
+
+script: |
+  # Days since 1970-01-01, a Thursday, give the day of the week: 0 is Monday.
+  def next_opening(now):
+      day = now.unix // 86400
+      saturday = day + (5 - (day + 3) % 7) % 7
+      opening = fms.from_timestamp(saturday * 86400 + 18 * 3600)
+      if opening <= now:
+          opening = fms.from_timestamp(opening.unix + 7 * 86400)
+      return opening
+
+  def countdown(ctx):
+      left = fms.split_duration(next_opening(ctx.now()) - ctx.now())
+      return "%dd %dh %sm" % (left.days, left.hours, fms.format_number(left.minutes, digits=2))
+
+  def kick(client, ctx):
+      return {"kick": "\n".join([
+          "§6§lExample Network §7opens in §f" + countdown(ctx),
+          "",
+          "§7See you Saturday at §f18:00 UTC§7, %s!" % (fms.sanitize(client.username) or "player"),
+          "§7Join the waitlist at §bexample.com/beta",
+      ])}
+
+servers:
+  default:
+    status:
+      description: "§6§lExample Network §8- §aopening soon\n§7Survival, creative and minigames"
+      favicon: example-network.png
+      players:
+        max: 500
+        online: 0
+        sample:
+          - { name: "§6§lExample Network", id: 00000000-0000-0000-0000-000000000000 }
+          - { name: "§7Opens §fSaturday, 18:00 UTC", id: 00000000-0000-0000-0000-000000000000 }
+          - { name: "§7Waitlist: §bexample.com/beta", id: 00000000-0000-0000-0000-000000000000 }
+    kick: "§6§lExample Network §7opens Saturday at §f18:00 UTC§7.\n\n§7Join the waitlist at §bexample.com/beta"
+    join_script: kick(client, ctx)

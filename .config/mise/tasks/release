@@ -5,7 +5,7 @@ set -Eeuo pipefail
 shopt -s inherit_errexit
 
 function main() {
-  local version release newest
+  local version release newest notes
   # Not "git describe": a commit can have several tags (v2.0.0-rc.1, v2.0.0).
   version="$GITHUB_REF_NAME"
   release="${version#v}"
@@ -17,9 +17,29 @@ function main() {
     echo "error: ${version} is not newer than the release ${newest}" >&2
     return 1
   fi
+  notes="$(mktemp)"
+  changelog_section "$release" "$version" >"$notes"
+  # A pre-release has the notes of its release, else the unreleased changes.
+  if [[ "$version" == *-* ]] && ! has_text "$notes"; then
+    changelog_section Unreleased "$version" >"$notes"
+  fi
+  if ! has_text "$notes"; then
+    echo "error: CHANGELOG.md has no notes for ${release}" >&2
+    return 1
+  fi
   GORELEASER_CURRENT_TAG="$version" goreleaser release \
     --clean \
-    --config .config/goreleaser.yaml
+    --config .config/goreleaser.yaml \
+    --release-notes "$notes"
+}
+
+# Print a section of CHANGELOG.md, its relative links (without a colon, unlike
+# URLs) pointing to the tag.
+function changelog_section() {
+  local _title="[$1]"
+  local _blob="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/$2"
+  awk -v title="$_title" -- '$1 == "##" { section = $2 == title; next } section' CHANGELOG.md |
+    sed -E "s|\]\(([^)#:][^):]*)\)|](${_blob}/\1)|g"
 }
 
 # Print the newest release, not a pre-release, other than the given tag.
@@ -32,6 +52,10 @@ function newest_release() {
 function is_newer() {
   if [[ "$1" == "$2" ]]; then return 1; fi
   printf '%s\n' "$2" "$1" | sort -V -C
+}
+
+function has_text() {
+  grep -q -e '[^[:space:]]' -- "$1"
 }
 
 eval 'main "$@";exit "$?"'
