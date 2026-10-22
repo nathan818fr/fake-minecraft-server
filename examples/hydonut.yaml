@@ -1,0 +1,102 @@
+# Hypixel + DonutSMP, and any upstream you add: one server list entry that
+# adds up their players, ranks them, and sends players to the busiest one.
+# Add one: FMS_UPSTREAMS_WYNNCRAFT='{ address: play.wynncraft.com, interval: 15s }'
+
+upstreams:
+  hypixel: { address: mc.hypixel.net, interval: 15s }
+  donutsmp: { address: donutsmp.net, interval: 15s }
+
+script: |
+  NO_ID = "00000000-0000-0000-0000-000000000000"
+
+  # How each upstream is shown; others show their ID in white.
+  STYLES = {"hypixel": ("Hypixel", "#ffaa00"), "donutsmp": ("DonutSMP", "#55ffff")}
+
+  TAGLINES = [
+      "one entry to count them all",
+      "refresh me, I'm live",
+      "the biggest lobby you can't join",
+  ]
+
+  def style(u):
+      return STYLES.get(u.id, (u.id, "white"))
+
+  def legacy_name(u):
+      label, color = style(u)
+      return fms.to_legacy({"text": label, "color": color, "bold": True})
+
+  def num(n):
+      return fms.format_number(n, sep=",")
+
+  def percent(part, total):
+      if total == 0:
+          return "0%"
+      return fms.format_number(100.0 * part / total, decimals=1) + "%"
+
+  # The upstreams that answer, with their players, busiest first.
+  def ranked(ctx):
+      up = [(u, u.status.get("players", {}).get("online", 0)) for u in ctx.upstreams() if u.status]
+      return sorted(up, key=lambda p: p[1], reverse=True)
+
+  # The names of the upstreams, busiest first, then the ones offline.
+  def title(ctx):
+      parts = []
+      for u in [p[0] for p in ranked(ctx)] + [u for u in ctx.upstreams() if not u.status]:
+          label, color = style(u)
+          if parts:
+              parts.append({"text": " + ", "color": "white"})
+          if u.status:
+              parts.append({"text": label, "color": color})
+          else:
+              parts.append({"text": label, "color": "dark_gray", "strikethrough": True})
+      return parts
+
+  def status(ctx, server):
+      up = ranked(ctx)
+      if not up:
+          return {"status": fms.merge(server.status, {"description": "§c§lEveryone is asleep\n§7§ocome back later"})}
+      total, capacity = 0, 0
+      for u, n in up:
+          total += n
+          capacity += u.status.get("players", {}).get("max", 0)
+      leader, best = up[0]
+      facts = TAGLINES + [
+          "%s leads with %s" % (style(leader)[0], percent(best, total)),
+          "%s players right now" % num(total),
+      ]
+      sample = []
+      for i, p in enumerate(up):
+          u, n = p
+          sample.append("§8#%d %s §f%s §7players §8(%s)" % (i + 1, legacy_name(u), num(n), percent(n, total)))
+      for u in ctx.upstreams():
+          if not u.status:
+              sample.append("§8✖ §7%s §coffline" % style(u)[0])
+      ages = [u.age_ms for u in ctx.upstreams() if u.age_ms != None]
+      if ages:
+          sample.append("§8updated %ss ago" % fms.format_number(max(ages) / 1000))
+      patch = {
+          "description": {"text": "", "bold": True, "extra": title(ctx) + [
+              {"text": "\n" + ctx.choice(facts), "color": "gray", "bold": False, "italic": True},
+          ]},
+          "players": {"online": total, "max": capacity, "sample": [{"name": s, "id": NO_ID} for s in sample]},
+      }
+      favicon = leader.status.get("favicon")
+      if favicon:
+          patch["favicon"] = favicon  # The busiest one's icon.
+      return {"status": fms.merge(server.status, patch)}
+
+  def kick(client, ctx):
+      lines = ["§e§lNice try, %s!" % (fms.sanitize(client.username) or "stranger"), "", "§7This entry only counts players."]
+      up = ranked(ctx)
+      if up:
+          u, n = up[0]
+          lines.append("§7Busiest right now: %s §7with §f%s §7players" % (legacy_name(u), num(n)))
+          lines.append("§7Join it at §f" + u.address)
+      return {"kick": "\n".join(lines)}
+
+servers:
+  default:
+    status:
+      description: "§6§lHypixel §f§l+ §b§lDonutSMP\n§7§ostarting up..."
+    ping_script: status(ctx, server)
+    join_script: kick(client, ctx)

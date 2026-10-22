@@ -1,0 +1,12 @@
+# FunCraft.net since it closed: the server list shows it as closed, "Serveur
+# Fermé" in red in place of the player counts (a protocol version that no
+# client has), and players who join get a farewell.
+
+servers:
+  default:
+    status:
+      description: "      §f§l»§6§l»§f§l»§r §6§lFunCraft§r §f§l«§6§l«§f§l«§f Mini-Jeux, PvP et Fun !\n    §eRush§f, §aHikabrain§f, §dFreeCube§f, §bSkyWars§f, §6Survival§f, ..."
+      favicon: funcraft.png
+      version: { name: "§cServeur Fermé", protocol: 0 }
+      players: { max: 0, online: 0 }
+    kick: "§cServeur fermé.\n\n§fTous les lits ont été cassés.\n§7GG à tous et merci d'avoir joué !"

@@ -1,0 +1,68 @@
+# A network with several servers, each on its own address: the lobby, shown
+# from its real status while it answers; a creative server; a staging server
+# that only the office network sees; and a message for outdated clients.
+# Everything else, such as scanners connecting to the bare IP address, sees
+# the default server.
+
+upstreams:
+  # Behind a proxy that routes by host name: the handshake tells the host
+  # that players connect to.
+  lobby:
+    address: 10.0.0.5:25577
+    handshake: { host: play.example.com, port: 25565 }
+
+script: |
+  OFFICE = ["198.51.100.0/24", "2001:db8:100::/48"]
+
+  def from_office(client):
+      return fms.in_network(client.ip, *OFFICE)
+
+servers:
+  default:
+    status:
+      description: "§6Example Network\n§7Join us on §fplay.example.com"
+      favicon: example-network.png
+    kick: "§6Join us on §fplay.example.com"
+
+  # Uses the lobby upstream, which has its ID: this status is shown while the
+  # lobby does not answer.
+  lobby:
+    status:
+      description: "§6Example Network\n§eThe lobby is restarting, back in a minute"
+      favicon: example-network.png
+      players: { max: 0, online: 0 }
+    kick: "§eThe lobby is restarting.\n§7Try again in a minute."
+
+  creative:
+    status:
+      description: "§6Example Network §8- §bCreative\n§7Opening next month"
+      favicon: example-network.png
+    kick: "§bCreative §7opens next month."
+
+  staging:
+    status: { description: "§eStaging §7- staff only" }
+    kick: "§eStaging is restarting."
+
+  # For clients older than 1.8, which see "1.8+" in red.
+  outdated:
+    client_protocol: never
+    status:
+      description: "§cExample Network requires Minecraft 1.8 or later"
+      version: { name: "§c1.8+", protocol: 47 }
+    kick: "§cPlease update to Minecraft 1.8 or later."
+
+rules:
+  # Clients that send no version (-1), such as status checkers, are left out.
+  - name: outdated
+    when: "client.legacy or (client.protocol >= 0 and client.protocol < 47)"
+    server: outdated
+  - name: staging
+    host: [staging.example.com]
+    when: from_office(client)
+    server: staging
+  - name: creative
+    host: [.creative.example.com]
+    server: creative
+  - name: lobby
+    host: [.example.com]
+    server: lobby

@@ -27,6 +27,12 @@ run = "go test -race ./..."
 description = "Run the benchmarks"
 run = "go test -run '^$' -bench . -benchmem ./..."
 
+[tasks.screenshots]
+description = "Take the screenshots of the documentation in Minecraft, in a headless Wayland compositor (Linux)"
+tools = { java = "temurin-25", uv = "0" }
+# Not in tools: mise cannot install the conda tools of a task from the lockfile.
+run = "mise x conda:weston@16.0.0 conda:xwayland@24.1.14 conda:xdotool@4.20260303.1 -- uv run --script tools/screenshots.py"
+
 [tasks.check]
 description = "Run everything CI runs"
 depends = ["lint", "test"]

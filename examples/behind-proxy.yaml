@@ -1,0 +1,26 @@
+# Behind a TCP proxy, such as HAProxy, that sends the PROXY protocol, so that
+# logs, connections.max_per_ip and rules see the address of each client
+# rather than the proxy's (see docs/deployment.md, "Behind a proxy").
+
+listen:
+  # Direct clients, without header.
+  - ":25565"
+  # The proxies on the private network. Connections from other addresses are
+  # reset, as they could send a header with a forged address.
+  - address: ":25566"
+    proxy_protocol: true
+    trusted_proxies: [10.0.0.0/8, "fd00::/8"]
+  # A proxy on the same machine. Whoever can connect to the socket is trusted:
+  # keep it in a directory that only the server and the proxy can enter.
+  # - address: unix:/run/fake-minecraft-server/proxy.sock
+  #   proxy_protocol: true
+
+# Counts each client, not the proxy, thanks to the PROXY protocol:
+# connections:
+#   max_per_ip: 8
+
+servers:
+  default:
+    status:
+      description: "§6Example Network §8- §7behind a proxy"
+    kick: "§cNot available"

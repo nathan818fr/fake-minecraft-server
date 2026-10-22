@@ -448,3 +448,19 @@ func TestFileMissing(t *testing.T) {
 		t.Errorf("Load() error = %v, want %s", err, want)
 	}
 }
+
+// The configurations of examples/ load, scripts and favicons included, so that
+// they stay valid.
+func TestExamples(t *testing.T) {
+	paths, err := filepath.Glob("../../examples/*.yaml")
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("no examples: %v", err)
+	}
+	for _, path := range paths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			if _, err := Load([]string{"FMS_CONFIG_FILE=" + path}); err != nil {
+				t.Errorf("Load() error: %v", err)
+			}
+		})
+	}
+}
