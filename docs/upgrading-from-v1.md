@@ -1,8 +1,11 @@
 # Upgrading from v1
 
-v2 is a rewrite in Go. Its configuration is new: the v1 variables are no
-longer read, and a v1 setup needs the changes below. Everything v1 did, v2
-does, with the same image name, except `LISTEN_BACKLOG`.
+v2 is a rewrite in Go. Its configuration is new: a v1 setup needs the changes
+below. Until then, if neither `FMS_CONFIG_FILE` nor any other `FMS_` variable
+is set, v2 reads the v1 variables, ignores the values that v1 ignored, such as
+a favicon it cannot read, and logs a warning with the `FMS_` variables that
+replace them. Everything v1 did, v2 does, with the same image name, except
+`LISTEN_BACKLOG`.
 
 ## The image
 

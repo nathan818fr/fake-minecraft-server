@@ -40,11 +40,15 @@ configuration is new: see [Upgrading from v1](docs/upgrading-from-v1.md).
   configuration mistakes are handled: see
   [Upgrading from v1](docs/upgrading-from-v1.md).
 
-### Removed
+### Deprecated
 
 - The v1 variables (`MOTD`, `KICK_MESSAGE`, `LISTEN_PORT`...), replaced by
-  the configuration file and its variables. `LISTEN_BACKLOG` has no
-  replacement.
+  the configuration file and its variables: read only without them, with a
+  warning that gives their replacement.
+
+### Removed
+
+- `LISTEN_BACKLOG`, which has no replacement.
 - `.env` files are no longer read: set the variables in the environment
   instead.
 

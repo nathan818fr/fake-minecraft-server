@@ -120,7 +120,8 @@ func check() error {
 
 // load reads the configuration, and sets up the logger that it configures.
 func load() (config.Config, *slog.LevelVar, error) {
-	cfg, err := config.Load(os.Environ())
+	environ, v1 := fromV1(os.Environ())
+	cfg, err := config.Load(environ)
 	level := new(slog.LevelVar)
 	if cfg.LogFormat != "" {
 		// Errors returned from now on, including the ones of the other
@@ -128,6 +129,7 @@ func load() (config.Config, *slog.LevelVar, error) {
 		level.Set(cfg.LogLevel)
 		slog.SetDefault(slog.New(logging.NewHandler(os.Stdout, cfg.LogFormat, level)))
 	}
+	v1.report(os.Stderr, slog.Default())
 	if err != nil {
 		// At the level of the errors, which they may explain, so that they
 		// are shown whatever the log level.

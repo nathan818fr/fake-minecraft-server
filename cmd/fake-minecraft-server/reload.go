@@ -56,7 +56,9 @@ func (r *reloader) run(ctx context.Context, signals <-chan os.Signal) {
 // the running one.
 func (r *reloader) reload(ctx context.Context) {
 	r.logger.Info("reloading")
-	cfg, err := config.Load(os.Environ())
+	// Reported at startup: variables keep their startup values.
+	environ, _ := fromV1(os.Environ())
+	cfg, err := config.Load(environ)
 	if err != nil {
 		logScriptPrints(r.logger, slog.LevelError, cfg.ScriptPrints)
 		r.fail(err)
