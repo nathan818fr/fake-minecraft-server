@@ -1,0 +1,315 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nathan818fr/fake-minecraft-server/releases/latest/download/config.schema.json",
+  "title": "Fake Minecraft Server configuration",
+  "description": "The configuration file of Fake Minecraft Server (see docs/configuration.md).",
+  "type": ["object", "null"],
+  "additionalProperties": false,
+  "properties": {
+    "listen": {
+      "description": "The addresses to listen on, each one alone or with its options.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/listener" },
+      "default": [":25565"]
+    },
+    "connections": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timeout": {
+          "description": "The maximum lifetime of a connection.",
+          "$ref": "#/$defs/duration",
+          "default": "3s"
+        },
+        "handshake_timeout": {
+          "description": "The time that a client has to send its handshake, and the request that follows it, after it connects (at most connections.timeout).",
+          "$ref": "#/$defs/duration",
+          "default": "1s"
+        },
+        "max": {
+          "description": "The maximum number of concurrent connections (0: unlimited).",
+          "$ref": "#/$defs/count",
+          "default": 10000
+        },
+        "max_per_ip": {
+          "description": "The maximum number of concurrent connections per IPv4 address or IPv6 /64 (0: unlimited).",
+          "$ref": "#/$defs/count",
+          "default": 8
+        },
+        "rate_limit_per_ip": {
+          "description": "The maximum number of new connections per second per IPv4 address or IPv6 /64, in bursts of up to twice as many (0: unlimited).",
+          "$ref": "#/$defs/count",
+          "default": 10
+        }
+      }
+    },
+    "log": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "description": "text, for people, or json, one object per line, for log collectors.",
+          "enum": ["text", "json"],
+          "default": "text"
+        },
+        "level": {
+          "description": "The minimum level logged.",
+          "enum": ["debug", "info", "warn", "error"],
+          "default": "info"
+        },
+        "rate_limit": {
+          "description": "The maximum number of lines logged per second about connections (0: unlimited).",
+          "$ref": "#/$defs/count",
+          "default": 1000
+        }
+      }
+    },
+    "no_software_signature": {
+      "description": "Whether to leave out \"fakeMinecraftServer\":true, which statuses end with so that tools can tell this server from real ones.",
+      "type": "boolean",
+      "default": false
+    },
+    "upstreams": {
+      "description": "The real servers polled for their status, by ID.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/id" },
+      "additionalProperties": { "$ref": "#/$defs/upstream" }
+    },
+    "servers": {
+      "description": "The servers that clients see, by ID; the default server answers the clients that no rule matches.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/id" },
+      "additionalProperties": { "$ref": "#/$defs/server" }
+    },
+    "rules": {
+      "description": "Which server each client sees: the first rule that matches answers.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/rule" }
+    },
+    "script": {
+      "description": "Functions and constants written in Starlark, for conditions and hooks.",
+      "type": "string"
+    },
+    "script_file": {
+      "description": "The path of a file that holds the script instead, relative to the configuration file.",
+      "type": "string"
+    }
+  },
+  "not": { "type": "object", "required": ["script", "script_file"] },
+  "$defs": {
+    "duration": {
+      "description": "A number and a unit among ms, s, m and h, such as 500ms, 3s or 1m30s.",
+      "type": "string",
+      "pattern": "^(([0-9]+\\.?[0-9]*|\\.[0-9]+)(ns|us|µs|μs|ms|s|m|h))+$"
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 2147483647
+    },
+    "id": {
+      "description": "Lowercase letters, digits and underscores.",
+      "type": "string",
+      "pattern": "^[a-z0-9_]+$"
+    },
+    "text": {
+      "description": "Text with formatting codes, such as \"§cRed\", or a text component.",
+      "type": ["string", "object", "array"]
+    },
+    "listener": {
+      "oneOf": [
+        { "$ref": "#/$defs/listenAddress" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["address"],
+          "properties": {
+            "address": { "$ref": "#/$defs/listenAddress" },
+            "proxy_protocol": {
+              "description": "Whether connections start with a PROXY protocol header.",
+              "type": "boolean",
+              "default": false
+            },
+            "trusted_proxies": {
+              "description": "For TCP listeners with proxy_protocol: the addresses or CIDR prefixes allowed to send a header.",
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          },
+          "dependentSchemas": {
+            "trusted_proxies": {
+              "required": ["proxy_protocol"],
+              "properties": { "proxy_protocol": { "const": true } }
+            }
+          }
+        }
+      ]
+    },
+    "listenAddress": {
+      "description": "host:port (an empty host listens on every interface), or unix:path for a Unix socket.",
+      "type": "string",
+      "pattern": "^(unix:.+|.*:[0-9]+)$"
+    },
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": { "$ref": "#/$defs/status" },
+        "upstream": {
+          "description": "The ID of the upstream whose status is shown in place of status while it answers, or \"\" for none (by default, the upstream with the ID of the server).",
+          "type": "string",
+          "pattern": "^[a-z0-9_]*$"
+        },
+        "client_protocol": {
+          "description": "When to report the protocol version of each client in place of the one of the status.",
+          "enum": ["auto", "always", "never"],
+          "default": "auto"
+        },
+        "kick": {
+          "description": "The message sent to players who try to join.",
+          "$ref": "#/$defs/text",
+          "default": "§cNot available"
+        },
+        "ping_script": {
+          "description": "A Starlark expression that can answer status requests in place of the status.",
+          "type": "string"
+        },
+        "join_script": {
+          "description": "A Starlark expression that can answer players in place of the kick message.",
+          "type": "string"
+        }
+      }
+    },
+    "status": {
+      "description": "The status shown in the server list, with the fields of the status JSON of Minecraft servers; other fields, such as the ones of mods, are sent as is.",
+      "type": "object",
+      "properties": {
+        "description": {
+          "description": "The message of the day, on up to two lines.",
+          "$ref": "#/$defs/text"
+        },
+        "favicon": {
+          "description": "The icon: the path of a 64×64 PNG file, or a data URI of one.",
+          "type": "string"
+        },
+        "version": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "description": "The version name, which clients show in red, in place of the player counts, when they see the server as incompatible.",
+              "type": "string"
+            },
+            "protocol": {
+              "description": "The protocol version.",
+              "type": "integer"
+            }
+          }
+        },
+        "players": {
+          "type": "object",
+          "properties": {
+            "max": { "description": "The maximum number of players.", "type": "integer" },
+            "online": { "description": "The number of players online.", "type": "integer" },
+            "sample": {
+              "description": "The lines shown when hovering over the player counts.",
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": { "type": "string" },
+                  "id": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "enforcesSecureChat": {
+          "description": "Whether the server requires signed chat messages (1.19.1+).",
+          "type": "boolean"
+        },
+        "previewsChat": {
+          "description": "Whether the server previews chat messages as players type them (1.19 to 1.19.2).",
+          "type": "boolean"
+        }
+      }
+    },
+    "upstream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["address"],
+      "properties": {
+        "address": {
+          "description": "host or host:port of the server, IPv6 addresses in brackets; without a port, its SRV record is followed.",
+          "type": "string",
+          "minLength": 1
+        },
+        "handshake": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "host": {
+              "description": "The host name sent in the handshake, for proxies that route by host name (by default, the host of address).",
+              "type": "string"
+            },
+            "port": {
+              "description": "The port sent in the handshake (by default, the port of address, or 25565).",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "protocol": {
+              "description": "The protocol version sent in the handshake; -1 asks the server for its own.",
+              "type": "integer",
+              "minimum": -2147483648,
+              "maximum": 2147483647,
+              "default": -1
+            }
+          }
+        },
+        "interval": {
+          "description": "The time between two polls.",
+          "$ref": "#/$defs/duration",
+          "default": "10s"
+        },
+        "retry_interval": {
+          "description": "The time between two polls after a failed one (by default, 10s, or interval if shorter).",
+          "$ref": "#/$defs/duration"
+        },
+        "timeout": {
+          "description": "The maximum duration of a poll (by default, 5s, or interval if shorter).",
+          "$ref": "#/$defs/duration"
+        },
+        "max_age": {
+          "description": "How long the last status stays in use while polls fail, at least interval + timeout (by default, 3 times interval, or interval + timeout if longer).",
+          "$ref": "#/$defs/duration"
+        }
+      }
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["server"],
+      "properties": {
+        "server": {
+          "description": "The ID of the server that clients see.",
+          "$ref": "#/$defs/id"
+        },
+        "host": {
+          "description": "The hosts that clients connected to, one of which must match.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "when": {
+          "description": "A condition written in Starlark.",
+          "type": "string"
+        },
+        "name": {
+          "description": "The name of the rule in logs: lowercase letters, digits and underscores, not only digits, nor default.",
+          "type": "string",
+          "pattern": "^[a-z0-9_]*[a-z_][a-z0-9_]*$",
+          "not": { "const": "default" }
+        }
+      }
+    }
+  }
+}

@@ -59,6 +59,14 @@ rules:
 
 Paths in the file, such as favicons, are relative to the file.
 
+Editors that use the YAML language server, such as VS Code with its YAML
+extension, complete and check the file with its JSON Schema, given by its first
+line:
+
+```yaml
+# yaml-language-server: $schema=https://github.com/nathan818fr/fake-minecraft-server/releases/latest/download/config.schema.json
+```
+
 ## Environment variables
 
 Each setting has an environment variable, which overrides the file: `FMS_`,

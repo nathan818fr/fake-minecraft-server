@@ -16,6 +16,8 @@ archives:
 
 checksum:
   name_template: checksums.txt
+  extra_files:
+    - glob: ./config.schema.json
 
 # The notes are the release's section of CHANGELOG.md (see "mise run release").
 changelog:
@@ -24,5 +26,7 @@ changelog:
 # Published last by the release workflow.
 release:
   draft: true
+  extra_files:
+    - glob: ./config.schema.json
   replace_existing_draft: true
   prerelease: auto
