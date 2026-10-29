@@ -14,6 +14,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Else installing a tool re-locks them all, which can change mise.lock.
+  MISE_LOCKED: "1"
+
 defaults:
   run:
     shell: bash

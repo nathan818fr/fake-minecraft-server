@@ -6,6 +6,11 @@ on:
 
 permissions: {}
 
+env:
+  # Else installing a tool re-locks them all, and GoReleaser refuses the dirty
+  # mise.lock.
+  MISE_LOCKED: "1"
+
 defaults:
   run:
     shell: bash
@@ -56,7 +61,10 @@ jobs:
         env:
           REGISTRY_TOKEN: ${{ github.token }}
         run: |
+          # Docker's file, which the attestation reads too; podman falls back
+          # to it.
           podman login \
+            --authfile "${HOME}/.docker/config.json" \
             --username "$GITHUB_ACTOR" \
             --password-stdin \
             -- "${IMAGE%%/*}" <<<"$REGISTRY_TOKEN"
