@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.0.0] - 2026-10-29
 
 A rewrite in Go: a single static binary, released as a much smaller container
 image, that answers every client from Beta 1.8 to the latest snapshots. The
@@ -57,5 +57,5 @@ configuration is new: see [Upgrading from v1](docs/upgrading-from-v1.md).
 The Node.js version. See the
 [v1 README](https://github.com/nathan818fr/fake-minecraft-server/tree/v1.1.0#readme).
 
-[Unreleased]: https://github.com/nathan818fr/fake-minecraft-server/compare/v1.1.0...HEAD
+[2.0.0]: https://github.com/nathan818fr/fake-minecraft-server/compare/v1.1.0...v2.0.0
 [1.1.0]: https://github.com/nathan818fr/fake-minecraft-server/tree/v1.1.0
